@@ -1,0 +1,104 @@
+name: "Flakebox — flaky-test triage"
+description: >-
+  Record JUnit results, detect flaky tests statistically, and post the
+  report to the job summary. Self-hosted: history lives in a SQLite DB
+  cached between runs. No SaaS, no per-seat pricing.
+inputs:
+  junit:
+    description: "Path to JUnit XML report (e.g. reports/junit.xml)"
+    required: true
+  db-key:
+    description: "Cache key prefix for the history DB"
+    required: false
+    default: "flakebox"
+  min-runs:
+    description: "Runs before a test can be called flaky"
+    required: false
+    default: "5"
+  fail-on-flaky:
+    description: "Fail the step when new flaky tests are detected"
+    required: false
+    default: "false"
+runs:
+  using: "composite"
+  steps:
+    # ------------------------------------------------------------------
+    # CACHE-RACE LIMITATION (read this before adding this action to a
+    # matrix build):
+    #
+    # GitHub's cache is immutable: every save creates a NEW cache entry and
+    # never updates the old one. This action restores the history DB from a
+    # prefix key and saves it under a run-unique key, so with N jobs (e.g. a
+    # matrix) each job starts from (roughly) the same base DB, records its
+    # own run, and saves its own entry — but only ONE of those entries
+    # becomes the restore target for the next run. In practice the other
+    # N-1 jobs' run data is silently discarded and detection history
+    # converges N times slower than it looks.
+    #
+    # The keys below are per-job (github.job identifies the job, so one
+    # job's saves never become another job's restore base). For MATRIX
+    # builds this does NOT combine the data: github.job is the same job id
+    # for every matrix combination, so callers with a matrix should also
+    # scope the db-key per combination, e.g.:
+    #
+    #   db-key: flakebox-${{ matrix.os }}-${{ matrix.python }}
+    #
+    # Recommended pattern for matrix builds — per-job DBs plus a final
+    # aggregator job:
+    #   1. Run this action in each matrix job (per-job DBs, as below) and
+    #      upload each job's ~/.flakebox/history.db as an artifact.
+    #   2. Add a final aggregator job (needs: [all matrix jobs]) that
+    #      downloads every per-job DB artifact and merges them into one.
+    #
+    # flakebox has NO merge command today — merging per-job SQLite DBs is
+    # future work (a candidate design is `flakebox merge --db out.db
+    # a.db b.db ...`; it is NOT implemented, do not call it). Until a merge
+    # exists, either run this action in a single job, or accept that each
+    # job's history stays local to that job.
+    # ------------------------------------------------------------------
+    - name: Restore flakebox history
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.flakebox/history.db
+        key: ${{ inputs.db-key }}-${{ github.job }}-${{ github.ref }}-${{ github.run_id }}
+        restore-keys: |
+          ${{ inputs.db-key }}-${{ github.job }}-${{ github.ref }}-
+          ${{ inputs.db-key }}-${{ github.job }}-refs/heads/main-
+
+    - name: Install flakebox
+      shell: bash
+      run: pip install "${{ github.action_path }}"
+
+    - name: Record results
+      shell: bash
+      run: >
+        python3 -m flakebox record
+        --junit "${{ inputs.junit }}"
+        --commit "${{ github.sha }}"
+        --branch "${{ github.ref_name }}"
+
+    - name: Report
+      id: report
+      shell: bash
+      run: |
+        python3 -m flakebox report --min-runs "${{ inputs.min_runs }}" >> "$GITHUB_STEP_SUMMARY"
+        N_NEW=$(python3 -m flakebox report --format json --min-runs "${{ inputs.min_runs }}" | python3 -c "
+        import json, sys
+        flaky = json.load(sys.stdin)['flaky']
+        print(sum(1 for t in flaky if not t['quarantined']))
+        ")
+        echo "new_flaky=$N_NEW" >> "$GITHUB_OUTPUT"
+
+    - name: Fail on new flakes (optional)
+      if: inputs.fail-on-flaky == 'true' && steps.report.outputs.new_flaky != '0'
+      shell: bash
+      run: |
+        echo "::error::flakebox detected ${{ steps.report.outputs.new_flaky }} new flaky test(s)"
+        exit 1
+
+    - name: Save flakebox history
+      uses: actions/cache/save@v4
+      if: always()
+      with:
+        path: ~/.flakebox/history.db
+        key: ${{ inputs.db-key }}-${{ github.job }}-${{ github.ref }}-${{ github.run_id }}

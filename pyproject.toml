@@ -1,0 +1,11 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "flakebox"
+version = "0.1.0"
+description = "Self-hosted flaky-test triage for small teams."
+readme = "README.md"
+requires-python = ">=3.10"
+[project.scripts]
+flakebox = "flakebox.cli:main"
