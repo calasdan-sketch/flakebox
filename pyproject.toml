@@ -3,7 +3,7 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 [project]
 name = "flakebox"
-version = "0.3.0"
+version = "0.4.0"
 description = "Self-hosted flaky-test triage for small teams."
 readme = "README.md"
 license = "MIT"

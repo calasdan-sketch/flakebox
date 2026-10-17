@@ -17,6 +17,7 @@ flakes, and tells you when they're stable enough to come back.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import sqlite3
@@ -27,7 +28,7 @@ from . import junit as junit_mod
 from . import quarantine as quar_mod
 from . import store as store_mod
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 
 def default_db() -> str:
@@ -158,9 +159,10 @@ def cmd_quarantine(args) -> int:
         print("run pytest with: pytest -p flakebox_quarantine")
     elif args.format == "deselect":
         # stdout is meant for `pytest $(flakebox quarantine --format
-        # deselect)`: only the args go there, the summary goes to stderr
+        # deselect)`: only the (shell-quoted) args go there, the summary
+        # goes to stderr
         print(summary, file=sys.stderr)
-        print(" ".join(quar_mod.deselect_args(full)))
+        print(quar_mod.deselect_line(full))
     else:
         print(json.dumps({"quarantined": full, "new": new}, indent=2))
     return 0
@@ -184,15 +186,25 @@ def cmd_history(args) -> int:
         if not hist:
             print(f"no history for {args.test}")
             return 0
-        s = detect_mod.summarize(conn, args.test)
+        # the same thresholds as `report`, so the two never disagree on
+        # what a test is (a recovered test is "recovered", not "flaky")
+        s = detect_mod.summarize(conn, args.test,
+                                 retire_after=args.retire_after,
+                                 stable_runs=args.stable_runs)
     finally:
         conn.close()
+    status = s["status"]
     rate = (f", flake rate {_pct(s['flake_rate'])}"
-            if s["status"] == detect_mod.FLAKY else "")
+            if status in (detect_mod.FLAKY, detect_mod.RECOVERED) else "")
+    if status == detect_mod.RECOVERED:
+        status += f" ({s['pass_streak']} consecutive passes)"
+    if s["runs"] < args.min_runs:
+        status += (f" (only {s['runs']} executed runs; report needs "
+                   f"{args.min_runs})")
     flags = ("".join([" [quarantined]" if s["quarantined"] else "",
                       " [retired: absent from the newest runs]"
                       if s["retired"] else ""]))
-    print(f"\n{args.test}: {s['status']} - {s['passes']} passed, "
+    print(f"\n{args.test}: {status} - {s['passes']} passed, "
           f"{s['failures']} failed over {s['runs']} executed runs "
           f"({s['skips']} skipped{rate}){flags}\n")
     for h in hist[:20]:
@@ -253,9 +265,10 @@ def build_parser() -> argparse.ArgumentParser:
     detect.add_argument("--min-runs", type=int, default=5,
                         help="executed runs (skips excluded) before a test "
                              "can be called flaky or failing (default 5)")
-    detect.add_argument("--stable-runs", type=int, default=10,
+    detect.add_argument("--stable-runs", type=int,
+                        default=detect_mod.STABLE_RUNS,
                         help="consecutive passes that make a test stable "
-                             "(default 10)")
+                             f"(default {detect_mod.STABLE_RUNS})")
     detect.add_argument("--retire-after", type=int,
                         default=detect_mod.RETIRE_AFTER, metavar="N",
                         help="a test absent from the newest N runs is "
@@ -292,7 +305,9 @@ def build_parser() -> argparse.ArgumentParser:
     u = sub.add_parser("unquarantine", parents=[common], help="Release a test.")
     u.add_argument("--test", required=True)
 
-    h = sub.add_parser("history", parents=[common], help="Per-test run history.")
+    h = sub.add_parser("history", parents=[common, detect],
+                       help="Per-test run history (same thresholds as "
+                            "report, so the status word agrees).")
     h.add_argument("--test", required=True)
     h.add_argument("--limit", type=int, default=50)
 
@@ -310,6 +325,40 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+# Tests patch this to exercise the Windows branch on any OS.
+_WINDOWS = os.name == "nt"
+
+
+def _pipe_gone(exc: BaseException) -> bool:
+    """Did the reader of our stdout go away?
+
+    POSIX raises BrokenPipeError (EPIPE). Windows reports the same thing as
+    a plain OSError with errno EINVAL and no file name (measured on Windows
+    11 / Python 3.11: errno 22, winerror None), raised by the FLUSH rather
+    than by the print, and it fails a second time at interpreter exit
+    (status 120) unless fd 1 is pointed at the null device first."""
+    if isinstance(exc, BrokenPipeError):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    if exc.errno == errno.EPIPE:
+        return True
+    return (_WINDOWS and exc.errno == errno.EINVAL
+            and getattr(exc, "filename", None) is None)
+
+
+def _broken_pipe() -> int:
+    """stdout's reader went away (`flakebox report | head`): leave
+    quietly. stdout is pointed at the null device first so the
+    interpreter's exit-time flush cannot raise the same error again."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+    except (OSError, ValueError, AttributeError):
+        pass
+    return 0
+
+
 def main(argv=None) -> int:
     _harden_streams()
     args = build_parser().parse_args(argv)
@@ -318,11 +367,18 @@ def main(argv=None) -> int:
             "history": cmd_history, "export": cmd_export,
             "import": cmd_import}
     try:
-        return cmds[args.cmd](args)
+        rc = cmds[args.cmd](args)
+        if sys.stdout is not None:
+            sys.stdout.flush()  # a closed pipe surfaces here, not at interpreter exit
+        return rc
     except sqlite3.DatabaseError as e:
         print(f"error: cannot use database {args.db or default_db()}: {e}",
               file=sys.stderr)
         return 2
+    except OSError as e:
+        if _pipe_gone(e):
+            return _broken_pipe()
+        raise
 
 
 if __name__ == "__main__":

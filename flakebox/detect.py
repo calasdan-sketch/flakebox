@@ -5,7 +5,10 @@ Definitions (skipped runs never count as evidence either way):
 - executed runs = passes + failures (``failed`` and ``error`` both fail)
 - FLAKY   = at least one pass AND at least one failure across the window,
             over at least ``min_runs`` executed runs, and not currently on
-            a pass streak of ``stable_runs`` (that is a recovered test).
+            a pass streak of ``stable_runs``.
+- RECOVERED = would be flaky, but the newest ``stable_runs`` executed
+            runs all passed: it has recovered and is left alone (not
+            re-quarantined); ``report`` and ``history`` both say so.
 - FAILING = executed at least ``min_runs`` times and never passed.
             Broken, not flaky - a different problem, don't quarantine it.
 - PASSING = executed at least ``min_runs`` times and never failed.
@@ -15,6 +18,9 @@ Definitions (skipped runs never count as evidence either way):
             ``retire_after`` runs: deleted or renamed. Listed on its own
             and otherwise left out, so a test removed from the suite
             does not stay "consistently failing" for fifty more builds.
+
+classify() is the one place these words are decided; report, history
+and the JSON output all go through it.
 """
 
 from __future__ import annotations
@@ -22,13 +28,21 @@ from __future__ import annotations
 from . import store as store_mod
 
 FLAKY, FAILING, PASSING, UNKNOWN = "flaky", "failing", "passing", "unknown"
+RECOVERED = "recovered"
 FAIL_OUTCOMES = ("failed", "error")
 RETIRE_AFTER = 3  # absent from this many newest runs -> retired
+STABLE_RUNS = 10  # consecutive newest passes that make a test stable
 
 
-def classify(passes: int, failures: int) -> str:
-    """The three-way call on executed runs alone (no threshold)."""
+def classify(passes: int, failures: int, pass_streak: int = 0,
+             stable_runs: int = 0) -> str:
+    """The status word for a test's executed runs (no min-runs
+    threshold). With `stable_runs` > 0, a pass-and-fail history whose
+    newest `stable_runs` executed runs all passed is RECOVERED rather
+    than FLAKY - the same call `report` makes, so `history` agrees."""
     if passes and failures:
+        if stable_runs and pass_streak >= stable_runs:
+            return RECOVERED
         return FLAKY
     if failures:
         return FAILING
@@ -37,10 +51,10 @@ def classify(passes: int, failures: int) -> str:
     return UNKNOWN
 
 
-def stats(outcomes_newest_first: list[str]) -> dict:
-    """Pass/fail/skip counts, fail rate over executed runs, and the
-    current pass streak (consecutive newest passes; a skip neither
-    extends nor breaks it)."""
+def stats(outcomes_newest_first: list[str], stable_runs: int = 0) -> dict:
+    """Pass/fail/skip counts, fail rate over executed runs, the current
+    pass streak (consecutive newest passes; a skip neither extends nor
+    breaks it) and the status from classify()."""
     passes = sum(1 for o in outcomes_newest_first if o == "passed")
     fails = sum(1 for o in outcomes_newest_first if o in FAIL_OUTCOMES)
     skips = sum(1 for o in outcomes_newest_first if o == "skipped")
@@ -61,14 +75,17 @@ def stats(outcomes_newest_first: list[str]) -> dict:
         "skips": skips,
         "flake_rate": (fails / executed) if executed else 0.0,
         "pass_streak": streak,
-        "status": classify(passes, fails),
+        "status": classify(passes, fails, streak, stable_runs),
     }
 
 
 def summarize(conn, test_id: str, window: int = 50,
-              retire_after: int = RETIRE_AFTER) -> dict:
+              retire_after: int = RETIRE_AFTER,
+              stable_runs: int = STABLE_RUNS) -> dict:
+    """One test's stats with the same status word `report` would use
+    (`flakebox history`)."""
     hist = store_mod.test_history(conn, test_id, limit=window)  # newest first
-    s = stats([h["outcome"] for h in hist])
+    s = stats([h["outcome"] for h in hist], stable_runs)
     s["test_id"] = test_id
     s["quarantined"] = store_mod.is_quarantined(conn, test_id)
     s["retired"] = bool(hist) and test_id not in store_mod.active_test_ids(
@@ -76,7 +93,7 @@ def summarize(conn, test_id: str, window: int = 50,
     return s
 
 
-def analyze(conn, min_runs: int = 5, stable_runs: int = 10,
+def analyze(conn, min_runs: int = 5, stable_runs: int = STABLE_RUNS,
             window: int = 50, retire_after: int = RETIRE_AFTER) -> dict:
     """Return {flaky: [...], broken: [...], stable: [...], retired: [...]}
     ranked lists.
@@ -115,7 +132,7 @@ def analyze(conn, min_runs: int = 5, stable_runs: int = 10,
     flaky, broken, stable, retired = [], [], [], []
     for test_id, (outcomes, _first_seen, last_run) in sorted(
             by_test.items(), key=lambda kv: kv[1][1]):
-        s = stats(outcomes)
+        s = stats(outcomes, stable_runs)
         s["test_id"] = test_id
         s["quarantined"] = test_id in quarantined_ids
         if last_run < horizon:
@@ -126,12 +143,11 @@ def analyze(conn, min_runs: int = 5, stable_runs: int = 10,
         s["retired"] = False
         if s["runs"] < min_runs:
             continue  # not enough executed runs to say anything
-        recovered = s["pass_streak"] >= stable_runs
-        if s["status"] == FLAKY and not recovered:
+        if s["status"] == FLAKY:  # classify() already set RECOVERED aside
             flaky.append(s)
         elif s["status"] == FAILING:
             broken.append(s)
-        if s["quarantined"] and recovered:
+        if s["quarantined"] and s["pass_streak"] >= stable_runs:
             stable.append(s)
     flaky.sort(key=lambda s: (-s["flake_rate"], -s["failures"]))
     broken.sort(key=lambda s: -s["failures"])

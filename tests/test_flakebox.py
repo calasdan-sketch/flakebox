@@ -8,11 +8,13 @@ read-only or still-open files (Windows).
 """
 
 import argparse
+import importlib.util
 import io
 import json
 import os
 import random
 import re
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -727,9 +729,10 @@ class TestPortability(unittest.TestCase):
 
 
 def open_calls(src: str) -> list:
-    """Argument text of every `open(...)` call, parentheses balanced."""
+    """Argument text of every `open(...)` call, parentheses balanced
+    (`os.open(...)` hands out a file descriptor and has no encoding)."""
     out = []
-    for m in re.finditer(r"\bopen\(", src):
+    for m in re.finditer(r"(?<![.\w])open\(", src):
         depth, i = 1, m.end()
         while i < len(src) and depth:
             depth += {"(": 1, ")": -1}.get(src[i], 0)
@@ -1486,12 +1489,13 @@ class TestRecordDedupe(unittest.TestCase):
         code, out, _ = run_cli("--db", db, "record", "--junit", p, "--commit", "new")
         self.assertEqual(code, 0)
         self.assertIn("recorded run 2", out)
-        # a legacy run has no hash: export/import carries it without
-        # pretending to recognise it
+        # a legacy run has no report hash: it is stamped with a content
+        # fingerprint instead (round 4), so export/import recognises it
         exp = os.path.join(tmp, "e.json")
         self.assertEqual(run_cli("--db", db, "export", "--out", exp)[0], 0)
         with open(exp, encoding="utf-8") as f:
-            self.assertIsNone(json.load(f)["runs"][0]["report_sha"])
+            sha = json.load(f)["runs"][0]["report_sha"]
+        self.assertTrue(sha.startswith(store_mod.LEGACY_PREFIX), sha)
 
 
 class TestDbFlagPosition(unittest.TestCase):
@@ -1546,8 +1550,361 @@ class TestDocsAndDeadCode(unittest.TestCase):
         self.assertEqual(int(m.group(1)), suite.countTestCases())
         for phrase in ("flakebox export", "flakebox import", "quarantine-output",
                        "export-output", "retired", "--retire-after", "best effort",
-                       "flakebox report --db", "already recorded", "--force"):
+                       "flakebox report --db", "already recorded", "--force",
+                       "PowerShell", "fingerprint", "recovered"):
             self.assertIn(phrase, readme, phrase)
+
+
+# ---------------------------------------------------------------------------
+# Round 4 panel findings
+# ---------------------------------------------------------------------------
+
+HAVE_PYTEST = importlib.util.find_spec("pytest") is not None
+
+PARAM_TESTS = (
+    "import pytest\n\n"
+    "@pytest.mark.parametrize('v', ['1.5', '2.0'])\n"
+    "def test_version(v):\n    pass\n\n"
+    "@pytest.mark.parametrize('v', ['0.5'])\n"
+    "def test_unrelated(v):\n    pass\n\n"
+    "@pytest.mark.parametrize('x', ['a b', 'c.d/e'])\n"
+    "def test_param(x):\n    pass\n\n"
+    "def test_plain():\n    pass\n"
+)
+
+
+def pytest_outcomes(cwd: str, extra: list) -> dict:
+    """Run real pytest on `cwd`/tests and return {junit id: outcome}."""
+    report = os.path.join(cwd, "j.xml")
+    if os.path.exists(report):
+        os.remove(report)
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         "--junitxml", report, "tests"] + extra,
+        cwd=cwd, capture_output=True, text=True, timeout=120,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert proc.returncode in (0, 5), proc.stdout + proc.stderr
+    return {r["test_id"]: r["outcome"] for r in junit_mod.parse(report)}
+
+
+class TestParametrisedIds(unittest.TestCase):
+    """R4-1: the plugin split the final segment on `.`, so
+    `test_version[1.5]` became `5]` and `test_unrelated[0.5]` was skipped
+    too (a false green)."""
+
+    def test_matcher_keeps_parameters_whole(self):
+        m = exec_plugin(mktemp(), ["placeholder::x"])["_matches"]
+        self.assertTrue(m("tests/test_c.py::test_version[1.5]",
+                          "tests.test_c::test_version[1.5]"))
+        self.assertFalse(m("tests/test_c.py::test_unrelated[0.5]",
+                           "tests.test_c::test_version[1.5]"))
+        self.assertFalse(m("tests/test_c.py::test_version[2.0]",
+                           "tests.test_c::test_version[1.5]"))
+        # path characters inside the parameters are parameters, not paths
+        self.assertTrue(m("tests/test_c.py::test_param[c.d/e]",
+                          "tests.test_c::test_param[c.d/e]"))
+        self.assertFalse(m("tests/test_c.py::test_param[c.d/e]",
+                           "tests.test_c::test_param[x.d/e]"))
+        self.assertTrue(m("tests/test_a.py::TestA::test_x[a-b.c]",
+                          "tests.test_a.TestA::test_x[a-b.c]"))
+        self.assertFalse(m("tests/test_a.py::TestA::test_x[a-b.c]",
+                           "tests.test_a.TestA::test_x"))
+
+    @unittest.skipUnless(HAVE_PYTEST, "pytest not installed")
+    def test_real_pytest_skips_only_the_quarantined_ids(self):
+        tmp = mktemp()
+        tdir = os.path.join(tmp, "tests")
+        os.makedirs(tdir)
+        write_raw(tdir, "test_c.py", PARAM_TESTS)
+        quar_mod.write_pytest(tmp, ["tests.test_c::test_version[1.5]",
+                                    "tests.test_c::test_param[a b]"])
+        outcomes = pytest_outcomes(tmp, ["-p", "flakebox_quarantine"])
+        self.assertEqual(outcomes, {
+            "tests.test_c::test_version[1.5]": "skipped",
+            "tests.test_c::test_version[2.0]": "passed",
+            "tests.test_c::test_unrelated[0.5]": "passed",
+            "tests.test_c::test_param[a b]": "skipped",
+            "tests.test_c::test_param[c.d/e]": "passed",
+            "tests.test_c::test_plain": "passed"})
+
+
+class TestDeselectQuoting(unittest.TestCase):
+    """R4-2: `--format deselect` printed unquoted ids; `test_param[a b]`
+    became two words in `pytest $(...)`."""
+
+    IDS = ["tests.test_c::test_param[a b]", "tests.test_c::test_param[$x;y]",
+           "tests.test_a.TestA::test_x"]
+
+    def test_line_is_shell_quoted(self):
+        line = quar_mod.deselect_line(self.IDS)
+        args = quar_mod.deselect_args(self.IDS)
+        self.assertEqual(args[1::2], ["tests/test_a.py::TestA::test_x",
+                                      "tests/test_c.py::test_param[$x;y]",
+                                      "tests/test_c.py::test_param[a b]"])
+        if os.name == "nt":
+            self.assertIn('"tests/test_c.py::test_param[a b]"', line)
+        else:
+            self.assertEqual(shlex.split(line), args)
+            self.assertIn("'tests/test_c.py::test_param[a b]'", line)
+            self.assertIn("'tests/test_c.py::test_param[$x;y]'", line)
+        # a plain id is left bare on every platform
+        self.assertEqual(quar_mod.deselect_line(["m.T::test_a"]),
+                         "--deselect m.py::T::test_a")
+        self.assertEqual(quar_mod.deselect_line(["pkg.mod::test_a"]),
+                         "--deselect pkg/mod.py::test_a")
+
+    def test_cli_output_round_trips_through_the_shell(self):
+        tmp = mktemp()
+        db = os.path.join(tmp, "q.db")
+        conn = store_mod.connect(db)
+        for tid in self.IDS:
+            store_mod.quarantine_add(conn, tid)
+        conn.close()
+        code, out, err = run_cli("--db", db, "quarantine", "--format", "deselect")
+        self.assertEqual(code, 0)
+        self.assertIn("3 in quarantine", err)
+        if os.name != "nt":
+            self.assertEqual(shlex.split(out), quar_mod.deselect_args(self.IDS))
+
+    @unittest.skipUnless(HAVE_PYTEST, "pytest not installed")
+    def test_real_pytest_deselects_a_parametrised_id_with_a_space(self):
+        tmp = mktemp()
+        tdir = os.path.join(tmp, "tests")
+        os.makedirs(tdir)
+        write_raw(tdir, "test_c.py", PARAM_TESTS)
+        line = quar_mod.deselect_line(["tests.test_c::test_param[a b]",
+                                       "tests.test_c::test_version[1.5]"])
+        # what `pytest $(flakebox quarantine --format deselect)` hands pytest
+        words = shlex.split(line, posix=(os.name != "nt"))
+        if os.name == "nt":
+            words = [w.strip('"') for w in words]
+        outcomes = pytest_outcomes(tmp, words)
+        self.assertEqual(sorted(outcomes), [
+            "tests.test_c::test_param[c.d/e]", "tests.test_c::test_plain",
+            "tests.test_c::test_unrelated[0.5]", "tests.test_c::test_version[2.0]"])
+
+
+class TestExportValidation(unittest.TestCase):
+    """R4-3: a malformed export (`"runs": [1, 2]`) was an AttributeError
+    traceback halfway through the import."""
+
+    def test_bad_shapes_are_clean_exit_2(self):
+        tmp = mktemp()
+        db = os.path.join(tmp, "x.db")
+        cases = {
+            "runs_ints.json": ('{"flakebox_export": 1, "runs": [1, 2]}',
+                               "runs[0] must be an object"),
+            "runs_obj.json": ('{"flakebox_export": 1, "runs": {}}',
+                              '"runs" must be a list'),
+            "results.json": ('{"flakebox_export": 1, "runs": [{"commit": "c", '
+                             '"results": [["a::t", "passed", 1]]}]}',
+                             "runs[0].results[0] must be"),
+            "results_str.json": ('{"flakebox_export": 1, "runs": [{"results": "x"}]}',
+                                 "runs[0].results must be a list"),
+            "commit.json": ('{"flakebox_export": 1, "runs": [{"commit": 5}]}',
+                            "runs[0].commit has the wrong type"),
+            "quar.json": ('{"flakebox_export": 1, "runs": [], "quarantine": [1]}',
+                          "quarantine[0] must be an object"),
+            "quar_obj.json": ('{"flakebox_export": 1, "quarantine": {"a": 1}}',
+                              '"quarantine" must be a list'),
+        }
+        for name, (text, expect) in cases.items():
+            p = write_raw(tmp, name, text)
+            code, _, err = run_cli("--db", db, "import", p)
+            self.assertEqual(code, 2, name)
+            self.assertIn("cannot import", err)
+            self.assertIn(expect, err, name)
+            self.assertNotIn("Traceback", err)
+        # nothing was written by any of the failed imports
+        conn = store_mod.connect(db)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)
+        conn.close()
+        # a minimal valid export still imports
+        p = write_raw(tmp, "ok.json", '{"flakebox_export": 1, "runs": [{"commit": "c",'
+                      ' "created_at": 5, "results": [["a::t", "passed", 1, null]]}]}')
+        code, out, _ = run_cli("--db", db, "import", p)
+        self.assertEqual(code, 0)
+        self.assertIn("imported 1 run(s)", out)
+
+
+class TestLegacyRunFingerprint(unittest.TestCase):
+    """R4-4: runs without a report_sha were re-added on every import."""
+
+    def legacy_db(self, tmp: str) -> str:
+        db = os.path.join(tmp, "old.db")
+        legacy = sqlite3.connect(db)
+        legacy.executescript(
+            "CREATE TABLE runs (id INTEGER PRIMARY KEY, commit_sha TEXT, "
+            "branch TEXT, created_at INTEGER);"
+            "CREATE TABLE results (run_id INTEGER, test_id TEXT, outcome TEXT, "
+            "duration_ms INTEGER, message TEXT);"
+            "CREATE TABLE quarantine (test_id TEXT PRIMARY KEY, "
+            "quarantined_at INTEGER, reason TEXT);"
+            "INSERT INTO runs (commit_sha, branch, created_at) VALUES ('old', 'main', 1);"
+            "INSERT INTO runs (commit_sha, branch, created_at) VALUES ('old2', 'main', 2);"
+            "INSERT INTO results VALUES (1, 'a::t', 'failed', 1, '');"
+            "INSERT INTO results VALUES (2, 'a::t', 'passed', 1, '');")
+        legacy.commit()
+        legacy.close()
+        return db
+
+    def test_import_twice_adds_nothing(self):
+        tmp = mktemp()
+        db = self.legacy_db(tmp)
+        conn = store_mod.connect(db)  # migration stamps fingerprints
+        shas = [r[0] for r in conn.execute("SELECT report_sha FROM runs ORDER BY id")]
+        conn.close()
+        self.assertTrue(all(s and s.startswith("legacy:") for s in shas), shas)
+        self.assertNotEqual(shas[0], shas[1])
+        exp = os.path.join(tmp, "e.json")
+        self.assertEqual(run_cli("--db", db, "export", "--out", exp)[0], 0)
+        local = os.path.join(tmp, "local.db")
+        code, out, _ = run_cli("--db", local, "import", exp)
+        self.assertIn("imported 2 run(s), skipped 0", out)
+        code, out, _ = run_cli("--db", local, "import", exp)
+        self.assertIn("imported 0 run(s), skipped 2 already recorded", out)
+        # and back into the DB it came from
+        code, out, _ = run_cli("--db", db, "import", exp)
+        self.assertIn("imported 0 run(s), skipped 2 already recorded", out)
+        conn = store_mod.connect(local)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 2)
+        conn.close()
+
+    def test_old_export_file_without_hashes_is_recognised(self):
+        # an export written by flakebox 0.3 carries "report_sha": null
+        tmp = mktemp()
+        exp = write_raw(tmp, "old.json", json.dumps({
+            "flakebox_export": 1, "quarantine": [],
+            "runs": [{"commit": "c1", "branch": None, "created_at": 100,
+                      "report_sha": None,
+                      "results": [["a::t", "failed", 3, "boom"]]},
+                     {"commit": "c1", "branch": None, "created_at": 101,
+                      "report_sha": None,
+                      "results": [["a::t", "passed", 2, None]]}]}))
+        db = os.path.join(tmp, "h.db")
+        code, out, _ = run_cli("--db", db, "import", exp)
+        self.assertIn("imported 2 run(s), skipped 0", out)
+        code, out, _ = run_cli("--db", db, "import", exp)
+        self.assertIn("imported 0 run(s), skipped 2 already recorded", out)
+        conn = store_mod.connect(db)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 2)
+        hist = store_mod.test_history(conn, "a::t")
+        self.assertEqual([h["outcome"] for h in hist], ["passed", "failed"])
+        conn.close()
+
+    def test_api_recorded_runs_are_fingerprinted_and_real_hashes_untouched(self):
+        tmp = mktemp()
+        db = os.path.join(tmp, "h.db")
+        conn = store_mod.connect(db)
+        rid = store_mod.record_run(conn, [result("a::t", "passed")], commit_sha="c")
+        sha = conn.execute("SELECT report_sha FROM runs WHERE id = ?", (rid,)).fetchone()[0]
+        self.assertTrue(sha.startswith(store_mod.LEGACY_PREFIX))
+        rid2 = store_mod.record_run(conn, [result("a::t", "passed")], commit_sha="c",
+                                    report_sha="abc123")
+        self.assertEqual(conn.execute("SELECT report_sha FROM runs WHERE id = ?",
+                                      (rid2,)).fetchone()[0], "abc123")
+        self.assertEqual(store_mod.find_run(conn, "c", "abc123"), rid2)
+        self.assertEqual(store_mod.fingerprint_legacy_runs(conn), 0)
+        conn.close()
+        self.assertEqual(store_mod.legacy_fingerprint("c", 1, [("a", "passed", 1, "")]),
+                         store_mod.legacy_fingerprint("c", 1, [["a", "passed", 1, ""]]))
+        self.assertNotEqual(store_mod.legacy_fingerprint("c", 1, [("a", "passed", 1, "")]),
+                            store_mod.legacy_fingerprint("c", 2, [("a", "passed", 1, "")]))
+
+
+class TestSharedClassification(unittest.TestCase):
+    """R4-5: `history` called a recovered test (18-pass streak) "flaky"
+    while `report` left it out; both now go through classify()."""
+
+    def recovered_db(self, tmp: str) -> str:
+        return db_from_outcomes(tmp, {"a::t": ["failed", "failed"] + ["passed"] * 18})
+
+    def test_history_and_report_agree(self):
+        tmp = mktemp()
+        db = self.recovered_db(tmp)
+        code, out, _ = run_cli("--db", db, "report", "--format", "json")
+        a = json.loads(out)
+        self.assertEqual(a["flaky"], [])
+        code, out, _ = run_cli("--db", db, "history", "--test", "a::t")
+        self.assertEqual(code, 0)
+        self.assertIn("a::t: recovered (18 consecutive passes)", out)
+        self.assertNotIn("a::t: flaky", out)
+        self.assertIn("flake rate 10%", out)
+        # the same thresholds move both commands together
+        code, out, _ = run_cli("--db", db, "report", "--format", "json",
+                               "--stable-runs", "25")
+        self.assertEqual([s["test_id"] for s in json.loads(out)["flaky"]], ["a::t"])
+        code, out, _ = run_cli("--db", db, "history", "--test", "a::t",
+                               "--stable-runs", "25")
+        self.assertIn("a::t: flaky -", out)
+        # a quarantined recovered test is "stable" in the report, and the
+        # JSON carries the same status word
+        conn = store_mod.connect(db)
+        store_mod.quarantine_add(conn, "a::t")
+        conn.close()
+        code, out, _ = run_cli("--db", db, "report", "--format", "json")
+        a = json.loads(out)
+        self.assertEqual([s["test_id"] for s in a["stable"]], ["a::t"])
+        self.assertEqual(a["stable"][0]["status"], detect_mod.RECOVERED)
+
+    def test_history_notes_too_few_runs(self):
+        tmp = mktemp()
+        db = db_from_outcomes(tmp, {"a::t": ["failed", "passed"]})
+        code, out, _ = run_cli("--db", db, "history", "--test", "a::t")
+        self.assertIn("a::t: flaky (only 2 executed runs; report needs 5)", out)
+        code, out, _ = run_cli("--db", db, "history", "--test", "a::t",
+                               "--min-runs", "2")
+        self.assertIn("a::t: flaky -", out)
+
+    def test_classify_is_the_single_source(self):
+        c = detect_mod.classify
+        self.assertEqual(c(3, 2), detect_mod.FLAKY)
+        self.assertEqual(c(3, 2, pass_streak=3, stable_runs=3), detect_mod.RECOVERED)
+        self.assertEqual(c(3, 2, pass_streak=2, stable_runs=3), detect_mod.FLAKY)
+        self.assertEqual(c(3, 2, pass_streak=99, stable_runs=0), detect_mod.FLAKY)
+        self.assertEqual(c(0, 2, pass_streak=0, stable_runs=3), detect_mod.FAILING)
+        self.assertEqual(c(5, 0, pass_streak=5, stable_runs=3), detect_mod.PASSING)
+        s = detect_mod.stats(["passed"] * 10 + ["failed"], stable_runs=10)
+        self.assertEqual(s["status"], detect_mod.RECOVERED)
+        self.assertEqual(detect_mod.stats(["passed"] * 10 + ["failed"])["status"],
+                         detect_mod.FLAKY)
+        self.assertFalse(hasattr(store_mod, "last_seen"))
+
+
+class TestBrokenPipe(unittest.TestCase):
+    """R4-6: `flakebox report | head` must not end in a traceback."""
+
+    def test_broken_pipe_in_main_is_a_quiet_exit_0(self):
+        tmp = mktemp()
+        db = make_db(tmp)
+
+        class Broken(io.TextIOBase):
+            def write(self, s):
+                raise BrokenPipeError(32, "Broken pipe")
+
+        err = io.StringIO()
+        with redirect_stdout(Broken()), redirect_stderr(err):
+            code = cli_mod.main(["--db", db, "report"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_reader_going_away_end_to_end(self):
+        tmp = mktemp()
+        db = make_db(tmp)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "flakebox", "--db", db, "report"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        proc.stdout.close()  # the reader (`head`) is gone before we write
+        try:
+            _, err = proc.communicate(timeout=60)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertNotIn(b"Traceback", err)
+        self.assertNotIn(b"Exception ignored", err)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import subprocess
 import time
 
 # The reason string the generated plugin attaches. junit.py looks for it
@@ -48,14 +50,17 @@ def _matches(nodeid: str, q: str) -> bool:
     # (`tests/test_mod.py::TestClass::test_x`) rarely agree on it.
     # The `.py` suffix (and any path) is stripped BEFORE the trailing
     # dot-split so classless node IDs (`test_mod.py::test_x`) match
-    # JUnit IDs (`test_mod::test_x`, `pkg.test_mod::test_x`).
+    # JUnit IDs (`test_mod::test_x`, `pkg.test_mod::test_x`). Parameters
+    # (`test_x[1.5]`, `test_x[a.b-c]`) are kept whole and compared
+    # exactly: only the part before `[` is a dotted name.
     # (Same class+test name in two modules will both match - v1 tradeoff.)
     def tail(seg: str) -> str:
+        base, br, params = seg.partition("[")
         for sep in ("/", chr(92)):  # drop any path (posix or windows)
-            seg = seg.split(sep)[-1]
-        if seg.endswith(".py"):
-            seg = seg[:-len(".py")]
-        return seg.split(".")[-1]
+            base = base.split(sep)[-1]
+        if base.endswith(".py"):
+            base = base[:-len(".py")]
+        return base.split(".")[-1] + br + params
     n = [tail(s) for s in nodeid.split("::")]
     m = [tail(s) for s in q.split("::")]
     return len(n) >= 2 and len(m) >= 2 and n[-2:] == m[-2:]
@@ -137,3 +142,15 @@ def deselect_args(test_ids: list[str]) -> list[str]:
     for tid in sorted(set(test_ids)):
         args += ["--deselect", pytest_nodeid(tid)]
     return args
+
+
+def deselect_line(test_ids: list[str]) -> str:
+    """deselect_args() as one shell line for `pytest $(flakebox quarantine
+    --format deselect)`. Each argument is quoted for the local shell, so
+    a parametrised id with a space or shell characters (`test_x[a b]`,
+    `test_x[$HOME]`) stays one argument: POSIX quoting via shlex, cmd.exe
+    double-quoting on Windows (see the README for PowerShell)."""
+    args = deselect_args(test_ids)
+    if os.name == "nt":
+        return subprocess.list2cmdline(args)
+    return shlex.join(args)

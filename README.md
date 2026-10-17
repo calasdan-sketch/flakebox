@@ -34,18 +34,19 @@ pytest -p flakebox_quarantine        # flakes are skipped, build stays green
 # they keep recording results and can earn their way back out:
 flakebox quarantine --format pytest --mode xfail -o .
 
-# the full quarantine set as pytest --deselect args (best effort, see
-# below) or as JSON for other runners
+# the full quarantine set as shell-quoted pytest --deselect args (best
+# effort, see below) or as JSON for other runners
 pytest $(flakebox quarantine --format deselect)
 flakebox quarantine --format json
 
 # when a quarantined test stabilizes, the report tells you:
 flakebox unquarantine --test "pkg.Class::test_x"
-flakebox history --test "pkg.Class::test_x"   # per-test run history
+flakebox history --test "pkg.Class::test_x"   # per-test run history, same
+                                              # thresholds/status words as report
 
 # carry the history around (CI artifact -> laptop, job -> aggregator):
 flakebox export --out flakebox-export.json
-flakebox import flakebox-export.json           # merges; re-import is a no-op
+flakebox import flakebox-export.json           # merges; re-import adds nothing
 ```
 
 `--db PATH` picks the database and goes before **or** after the
@@ -75,7 +76,16 @@ ids, so flakebox maps the common pytest shapes
 `--deselect` that matches nothing. A lowercase class name, a
 `python_files` pattern other than `*.py`, or a non-pytest producer breaks
 the guess; the generated plugin (`--format pytest`) suffix-matches node
-ids instead and is the reliable path.
+ids instead and is the reliable path. Each argument is quoted for the
+shell, so a parametrised id with a space or shell characters
+(`test_param[a b]`) survives `pytest $(...)` as one argument; on
+Windows the line is quoted for `cmd.exe`. PowerShell has no `$(...)`
+word splitting — use `Invoke-Expression "pytest $(flakebox quarantine
+--format deselect)"`, or the plugin.
+
+Parametrised ids are matched whole by the plugin: quarantining
+`test_version[1.5]` skips exactly that case, never `test_unrelated[0.5]`
+or `test_version[2.0]`.
 
 Example report:
 
@@ -103,10 +113,14 @@ never breaks a pass streak.
 
 - **flaky**: at least one pass *and* at least one failure (`failed` or
   `error`) across ≥5 executed runs (`--min-runs`), and not currently on
-  a pass streak of ≥10 (`--stable-runs`) — a test that has been passing
-  that long has recovered and is left alone, so quarantining it,
+  a pass streak of ≥10 (`--stable-runs`).
+- **recovered**: would be flaky, but the newest ≥10 executed runs all
+  passed — it has recovered and is left alone, so quarantining it,
   releasing it and re-quarantining it from the same stale failures can't
-  loop.
+  loop. `report` leaves it out of the flaky table and `flakebox history`
+  says `recovered (18 consecutive passes)`: one `classify()` decides the
+  word for every command, and `history` takes the same `--min-runs`,
+  `--stable-runs` and `--retire-after` flags as `report`.
 - **failing** (the "Consistently failing" section): ≥5 executed runs and
   never a pass. Broken, not flaky — different problem, don't quarantine
   it. `flakebox history` labels it `failing` and shows no flake rate.
@@ -145,9 +159,14 @@ The generated pytest plugin reads `flakebox_quarantine.json`:
 the quarantine set) as one JSON document. `flakebox import FILE...`
 merges exports into a DB: a run already present (same commit and same
 report hash) is skipped, so importing the same file twice, or into the
-DB it came from, adds nothing; quarantine entries merge as a set. This
-is how CI's history reaches a laptop, and how per-job DBs of a matrix
-build become one (see the Action).
+DB it came from, adds nothing; quarantine entries merge as a set. Runs
+recorded without a report hash (flakebox < 0.3, or through the Python
+API) carry a content **fingerprint** (`legacy:` + a digest of commit,
+timestamp and results) instead, stamped when the DB is opened, so they
+are recognised too. A malformed export is refused as a whole before
+anything is written (`error: cannot import ...: runs[0] must be an
+object`, exit 2). This is how CI's history reaches a laptop, and how
+per-job DBs of a matrix build become one (see the Action).
 
 ## GitHub Action
 
@@ -209,16 +228,16 @@ export).
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests   # 76 tests, no network, stdlib only
+python3 -m unittest discover -s tests   # 90 tests, no network, stdlib only
 python3 -m pytest -q                    # same suite
 ```
 
 No PyYAML anywhere (the tests read `action.yml` with a tiny flat reader
 and prove `import flakebox` works with `yaml` blocked). Tests point
 `HOME`/`USERPROFILE`/`APPDATA` at a throwaway directory, so they never
-touch your real `~/.flakebox`. One test drives real `pytest` as a
-subprocess to prove the mapped `--deselect` ids work (skipped when
-pytest is not installed). Runs on Windows 11: stdout/stderr are
+touch your real `~/.flakebox`. A few tests drive real `pytest` as a
+subprocess to prove the mapped `--deselect` ids and the generated plugin
+work on parametrised ids (skipped when pytest is not installed). Runs on Windows 11: stdout/stderr are
 reconfigured to replace unencodable characters (the report's emoji on a
 cp1252 console), and every text file is opened as UTF-8.
 
