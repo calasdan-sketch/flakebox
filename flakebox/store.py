@@ -78,11 +78,15 @@ def all_test_ids(conn: sqlite3.Connection) -> list[str]:
 
 
 def quarantine_add(conn: sqlite3.Connection, test_id: str,
-                   reason: str = "") -> None:
-    conn.execute("INSERT OR REPLACE INTO quarantine "
-                 "(test_id, quarantined_at, reason) VALUES (?, ?, ?)",
-                 (test_id, int(time.time()), reason))
+                   reason: str = "") -> bool:
+    """Add a test to the quarantine set. Idempotent (set semantics): an
+    already-quarantined test keeps its original timestamp and reason.
+    Returns True if the test was newly quarantined."""
+    cur = conn.execute("INSERT OR IGNORE INTO quarantine "
+                       "(test_id, quarantined_at, reason) VALUES (?, ?, ?)",
+                       (test_id, int(time.time()), reason))
     conn.commit()
+    return cur.rowcount == 1
 
 
 def quarantine_remove(conn: sqlite3.Connection, test_id: str) -> None:

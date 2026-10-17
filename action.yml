@@ -12,7 +12,7 @@ inputs:
     required: false
     default: "flakebox"
   min-runs:
-    description: "Runs before a test can be called flaky"
+    description: "Executed runs (skips excluded) before a test can be called flaky; passed to `flakebox report --min-runs`"
     required: false
     default: "5"
   fail-on-flaky:
@@ -81,8 +81,8 @@ runs:
       id: report
       shell: bash
       run: |
-        python3 -m flakebox report --min-runs "${{ inputs.min_runs }}" >> "$GITHUB_STEP_SUMMARY"
-        N_NEW=$(python3 -m flakebox report --format json --min-runs "${{ inputs.min_runs }}" | python3 -c "
+        python3 -m flakebox report --min-runs "${{ inputs.min-runs }}" >> "$GITHUB_STEP_SUMMARY"
+        N_NEW=$(python3 -m flakebox report --format json --min-runs "${{ inputs.min-runs }}" | python3 -c "
         import json, sys
         flaky = json.load(sys.stdin)['flaky']
         print(sum(1 for t in flaky if not t['quarantined']))

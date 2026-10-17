@@ -1,39 +1,71 @@
 """Flake detection: statistical, explainable, no ML.
 
-A test is FLAKY when it has both passes and failures across enough runs.
-A test that only ever fails is BROKEN (not flaky) — different problem.
-A quarantined test with enough consecutive passes is STABLE (un-quarantine).
+Definitions (skipped runs never count as evidence either way):
+
+- executed runs = passes + failures (``failed`` and ``error`` both fail)
+- FLAKY   = at least one pass AND at least one failure across the window,
+            over at least ``min_runs`` executed runs, and not currently on
+            a pass streak of ``stable_runs`` (that is a recovered test).
+- FAILING = executed at least ``min_runs`` times and never passed.
+            Broken, not flaky - a different problem, don't quarantine it.
+- PASSING = executed at least ``min_runs`` times and never failed.
+- STABLE  = a quarantined test whose newest ``stable_runs`` executed runs
+            all passed - the report tells you to un-quarantine it.
 """
 
 from __future__ import annotations
 
 from . import store as store_mod
 
+FLAKY, FAILING, PASSING, UNKNOWN = "flaky", "failing", "passing", "unknown"
+FAIL_OUTCOMES = ("failed", "error")
 
-def summarize(conn, test_id: str, window: int = 50) -> dict:
-    hist = store_mod.test_history(conn, test_id, limit=window)
-    # chronological for streak math
-    hist = hist[::-1]
-    passes = sum(1 for h in hist if h["outcome"] == "passed")
-    fails = sum(1 for h in hist if h["outcome"] in ("failed", "error"))
-    skips = sum(1 for h in hist if h["outcome"] == "skipped")
+
+def classify(passes: int, failures: int) -> str:
+    """The three-way call on executed runs alone (no threshold)."""
+    if passes and failures:
+        return FLAKY
+    if failures:
+        return FAILING
+    if passes:
+        return PASSING
+    return UNKNOWN
+
+
+def stats(outcomes_newest_first: list[str]) -> dict:
+    """Pass/fail/skip counts, fail rate over executed runs, and the
+    current pass streak (consecutive newest passes; a skip neither
+    extends nor breaks it)."""
+    passes = sum(1 for o in outcomes_newest_first if o == "passed")
+    fails = sum(1 for o in outcomes_newest_first if o in FAIL_OUTCOMES)
+    skips = sum(1 for o in outcomes_newest_first if o == "skipped")
     streak = 0
-    for h in reversed(hist):
-        if h["outcome"] == "passed":
+    for o in outcomes_newest_first:
+        if o == "passed":
             streak += 1
+        elif o == "skipped":
+            continue
         else:
             break
-    total = passes + fails
+    executed = passes + fails
     return {
-        "test_id": test_id,
-        "runs": len(hist),
+        "runs": executed,          # executed runs (skips excluded)
+        "recorded": len(outcomes_newest_first),
         "passes": passes,
         "failures": fails,
         "skips": skips,
-        "flake_rate": (fails / total) if total else 0.0,
+        "flake_rate": (fails / executed) if executed else 0.0,
         "pass_streak": streak,
-        "quarantined": store_mod.is_quarantined(conn, test_id),
+        "status": classify(passes, fails),
     }
+
+
+def summarize(conn, test_id: str, window: int = 50) -> dict:
+    hist = store_mod.test_history(conn, test_id, limit=window)  # newest first
+    s = stats([h["outcome"] for h in hist])
+    s["test_id"] = test_id
+    s["quarantined"] = store_mod.is_quarantined(conn, test_id)
+    return s
 
 
 def analyze(conn, min_runs: int = 5, stable_runs: int = 10,
@@ -41,10 +73,9 @@ def analyze(conn, min_runs: int = 5, stable_runs: int = 10,
     """Return {flaky: [...], broken: [...], stable: [...]} ranked lists.
 
     Single batched query (the most recent `window` runs per test, via
-    ROW_NUMBER), then pass/fail/streak counts computed in Python — no
-    per-test N+1 history fetches. Output semantics are identical to the
-    old per-test logic, including iteration order (first-appearance in
-    the results table) for the unsorted `stable` list.
+    ROW_NUMBER), then the counts from stats() in Python - no per-test
+    N+1 history fetches. Iteration order is first appearance in the
+    results table, which is the order of the unsorted `stable` list.
     """
     cur = conn.cursor()
     cur.execute(
@@ -57,49 +88,30 @@ def analyze(conn, min_runs: int = 5, stable_runs: int = 10,
         "  FROM results r"
         ") WHERE rn <= ? ORDER BY test_id, run_id DESC",
         (window,))
-    # outcomes per test, newest-run first (rn 1..window), mirroring the
-    # old ORDER BY runs.id DESC LIMIT window history used for streaks
+    # outcomes per test, newest-run first (rn 1..window)
     by_test: dict[str, tuple[list[str], int]] = {}
     for test_id, outcome, first_seen in cur.fetchall():
         if test_id in by_test:
             by_test[test_id][0].append(outcome)
         else:
             by_test[test_id] = ([outcome], first_seen)
-    # one fetch for the quarantine set (old code did one per test)
     qcur = conn.cursor()
     qcur.execute("SELECT test_id FROM quarantine")
     quarantined_ids = {row[0] for row in qcur.fetchall()}
     flaky, broken, stable = [], [], []
-    # first-appearance order, like the old all_test_ids() iteration
     for test_id, (outcomes, _first_seen) in sorted(
             by_test.items(), key=lambda kv: kv[1][1]):
-        passes = sum(1 for o in outcomes if o == "passed")
-        fails = sum(1 for o in outcomes if o in ("failed", "error"))
-        skips = sum(1 for o in outcomes if o == "skipped")
-        streak = 0
-        for o in outcomes:
-            if o == "passed":
-                streak += 1
-            else:
-                break
-        total = passes + fails
-        s = {
-            "test_id": test_id,
-            "runs": len(outcomes),
-            "passes": passes,
-            "failures": fails,
-            "skips": skips,
-            "flake_rate": (fails / total) if total else 0.0,
-            "pass_streak": streak,
-            "quarantined": test_id in quarantined_ids,
-        }
+        s = stats(outcomes)
+        s["test_id"] = test_id
+        s["quarantined"] = test_id in quarantined_ids
         if s["runs"] < min_runs:
-            continue
-        if s["failures"] >= 1 and s["passes"] >= 1:
+            continue  # not enough executed runs to say anything
+        recovered = s["pass_streak"] >= stable_runs
+        if s["status"] == FLAKY and not recovered:
             flaky.append(s)
-        elif s["passes"] == 0 and s["failures"] >= min_runs:
+        elif s["status"] == FAILING:
             broken.append(s)
-        if s["quarantined"] and s["pass_streak"] >= stable_runs:
+        if s["quarantined"] and recovered:
             stable.append(s)
     flaky.sort(key=lambda s: (-s["flake_rate"], -s["failures"]))
     broken.sort(key=lambda s: -s["failures"])
