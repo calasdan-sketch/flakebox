@@ -95,11 +95,45 @@ def write_pytest(out_dir: str, test_ids: list[str],
     return written
 
 
+def pytest_nodeid(test_id: str) -> str:
+    """Map a JUnit id to the pytest node id it most likely came from.
+
+    pytest writes classname = dotted module path + class names and
+    name = the function (with any [params]). Modules are lowercase by
+    convention and classes start with a capital, so the leading run of
+    segments that do not start with an uppercase letter is the module:
+
+        pkg.module.Class::test_x    -> pkg/module.py::Class::test_x
+        pkg.module.Outer.Inner::t   -> pkg/module.py::Outer::Inner::t
+        pkg.module::test_x          -> pkg/module.py::test_x
+        test_x (no classname)       -> test_x (unchanged)
+
+    Best effort: a lowercase class name, a `python_files` pattern that
+    is not `*.py`, or a non-pytest producer breaks the guess, and pytest
+    simply ignores a --deselect that matches nothing. The generated
+    plugin (--format pytest) suffix-matches instead and is the reliable
+    path. Ids already in node-id form (containing `/` or `.py::`) pass
+    through unchanged.
+    """
+    if "::" not in test_id or "/" in test_id or ".py::" in test_id:
+        return test_id
+    classname, _, rest = test_id.partition("::")
+    segs = [s for s in classname.split(".") if s]
+    if not segs:
+        return test_id
+    i = 0
+    while i < len(segs) and not segs[i][:1].isupper():
+        i += 1
+    module, classes = segs[:i], segs[i:]
+    if not module:  # classname is just class names: no module to place
+        return "::".join(classes + [rest])
+    return "::".join(["/".join(module) + ".py"] + classes + [rest])
+
+
 def deselect_args(test_ids: list[str]) -> list[str]:
-    """Best-effort `--deselect` args. IDs are JUnit-style; pytest node IDs
-    usually share the suffix, so this works more often than not - but the
-    generated plugin (--format pytest) is the reliable path."""
+    """`--deselect` args for pytest, with JUnit ids mapped to pytest node
+    ids by pytest_nodeid() (best effort - see there)."""
     args = []
     for tid in sorted(set(test_ids)):
-        args += ["--deselect", tid]
+        args += ["--deselect", pytest_nodeid(tid)]
     return args

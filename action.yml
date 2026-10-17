@@ -16,9 +16,31 @@ inputs:
     required: false
     default: "5"
   fail-on-flaky:
-    description: "Fail the step when new flaky tests are detected"
+    description: >-
+      Fail the step when flaky tests are detected that are not yet
+      quarantined. Without quarantine-output nothing ever quarantines
+      them in CI, so this fails EVERY build from the first flake; with
+      quarantine-output set, a new flake fails exactly one build and is
+      quarantined (acknowledged) in the history DB from the next run on.
     required: false
     default: "false"
+  quarantine-output:
+    description: >-
+      If set, run `flakebox quarantine --format json` after the report
+      and write the whole quarantine set to this file (e.g.
+      flakebox/quarantine.json). Upload it with actions/upload-artifact;
+      developers download it, generate the pytest plugin and commit it.
+      Empty (default) = never quarantine in CI.
+    required: false
+    default: ""
+  export-output:
+    description: >-
+      If set, write a portable JSON export of the history DB to this
+      file (`flakebox export --out`). Upload it as an artifact; locally,
+      `flakebox import <file>` merges it so the laptop sees CI's history,
+      and an aggregator job can merge per-job exports the same way.
+    required: false
+    default: ""
 runs:
   using: "composite"
   steps:
@@ -45,16 +67,15 @@ runs:
     #
     # Recommended pattern for matrix builds — per-job DBs plus a final
     # aggregator job:
-    #   1. Run this action in each matrix job (per-job DBs, as below) and
-    #      upload each job's ~/.flakebox/history.db as an artifact.
+    #   1. Run this action in each matrix job (per-job DBs, as below) with
+    #      export-output set, and upload each job's export as an artifact.
     #   2. Add a final aggregator job (needs: [all matrix jobs]) that
-    #      downloads every per-job DB artifact and merges them into one.
+    #      downloads every export and merges them into one DB with
+    #      `flakebox import a.json b.json ...` (runs already present -
+    #      same commit and report - are skipped, so re-importing is safe),
+    #      then runs `flakebox report` there.
     #
-    # flakebox has NO merge command today — merging per-job SQLite DBs is
-    # future work (a candidate design is `flakebox merge --db out.db
-    # a.db b.db ...`; it is NOT implemented, do not call it). Until a merge
-    # exists, either run this action in a single job, or accept that each
-    # job's history stays local to that job.
+    # There is no separate merge command: `flakebox import` IS the merge.
     # ------------------------------------------------------------------
     - name: Restore flakebox history
       uses: actions/cache/restore@v4
@@ -88,6 +109,24 @@ runs:
         print(sum(1 for t in flaky if not t['quarantined']))
         ")
         echo "new_flaky=$N_NEW" >> "$GITHUB_OUTPUT"
+
+    # Acknowledge the flaky set in the history DB and hand it to the
+    # developers: runs BEFORE the fail step so a new flake fails one
+    # build, not every build.
+    - name: Quarantine flaky tests (optional)
+      if: inputs.quarantine-output != ''
+      shell: bash
+      run: |
+        mkdir -p "$(dirname "${{ inputs.quarantine-output }}")"
+        python3 -m flakebox quarantine --format json --min-runs "${{ inputs.min-runs }}" > "${{ inputs.quarantine-output }}"
+        echo "quarantine set written to ${{ inputs.quarantine-output }}" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Export history (optional)
+      if: inputs.export-output != ''
+      shell: bash
+      run: |
+        mkdir -p "$(dirname "${{ inputs.export-output }}")"
+        python3 -m flakebox export --out "${{ inputs.export-output }}"
 
     - name: Fail on new flakes (optional)
       if: inputs.fail-on-flaky == 'true' && steps.report.outputs.new_flaky != '0'

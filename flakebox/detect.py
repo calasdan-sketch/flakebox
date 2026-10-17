@@ -11,6 +11,10 @@ Definitions (skipped runs never count as evidence either way):
 - PASSING = executed at least ``min_runs`` times and never failed.
 - STABLE  = a quarantined test whose newest ``stable_runs`` executed runs
             all passed - the report tells you to un-quarantine it.
+- RETIRED = a test with history that appears in none of the newest
+            ``retire_after`` runs: deleted or renamed. Listed on its own
+            and otherwise left out, so a test removed from the suite
+            does not stay "consistently failing" for fifty more builds.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from . import store as store_mod
 
 FLAKY, FAILING, PASSING, UNKNOWN = "flaky", "failing", "passing", "unknown"
 FAIL_OUTCOMES = ("failed", "error")
+RETIRE_AFTER = 3  # absent from this many newest runs -> retired
 
 
 def classify(passes: int, failures: int) -> str:
@@ -60,50 +65,65 @@ def stats(outcomes_newest_first: list[str]) -> dict:
     }
 
 
-def summarize(conn, test_id: str, window: int = 50) -> dict:
+def summarize(conn, test_id: str, window: int = 50,
+              retire_after: int = RETIRE_AFTER) -> dict:
     hist = store_mod.test_history(conn, test_id, limit=window)  # newest first
     s = stats([h["outcome"] for h in hist])
     s["test_id"] = test_id
     s["quarantined"] = store_mod.is_quarantined(conn, test_id)
+    s["retired"] = bool(hist) and test_id not in store_mod.active_test_ids(
+        conn, retire_after)
     return s
 
 
 def analyze(conn, min_runs: int = 5, stable_runs: int = 10,
-            window: int = 50) -> dict:
-    """Return {flaky: [...], broken: [...], stable: [...]} ranked lists.
+            window: int = 50, retire_after: int = RETIRE_AFTER) -> dict:
+    """Return {flaky: [...], broken: [...], stable: [...], retired: [...]}
+    ranked lists.
 
     Single batched query (the most recent `window` runs per test, via
     ROW_NUMBER), then the counts from stats() in Python - no per-test
     N+1 history fetches. Iteration order is first appearance in the
     results table, which is the order of the unsorted `stable` list.
+    Tests absent from the newest `retire_after` runs go to `retired`
+    (with where they were last seen) and nowhere else.
     """
     cur = conn.cursor()
     cur.execute(
-        "SELECT test_id, outcome, first_seen FROM ("
+        "SELECT test_id, outcome, first_seen, last_run FROM ("
         "  SELECT r.test_id AS test_id, r.outcome AS outcome,"
         "         r.run_id AS run_id,"
         "         ROW_NUMBER() OVER (PARTITION BY r.test_id"
         "                            ORDER BY r.run_id DESC) AS rn,"
-        "         MIN(r.rowid) OVER (PARTITION BY r.test_id) AS first_seen"
+        "         MIN(r.rowid) OVER (PARTITION BY r.test_id) AS first_seen,"
+        "         MAX(r.run_id) OVER (PARTITION BY r.test_id) AS last_run"
         "  FROM results r"
         ") WHERE rn <= ? ORDER BY test_id, run_id DESC",
         (window,))
     # outcomes per test, newest-run first (rn 1..window)
-    by_test: dict[str, tuple[list[str], int]] = {}
-    for test_id, outcome, first_seen in cur.fetchall():
+    by_test: dict[str, tuple[list[str], int, int]] = {}
+    for test_id, outcome, first_seen, last_run in cur.fetchall():
         if test_id in by_test:
             by_test[test_id][0].append(outcome)
         else:
-            by_test[test_id] = ([outcome], first_seen)
+            by_test[test_id] = ([outcome], first_seen, last_run)
     qcur = conn.cursor()
     qcur.execute("SELECT test_id FROM quarantine")
     quarantined_ids = {row[0] for row in qcur.fetchall()}
-    flaky, broken, stable = [], [], []
-    for test_id, (outcomes, _first_seen) in sorted(
+    recent = store_mod.recent_run_ids(conn, retire_after)
+    horizon = min(recent) if recent else 0  # oldest run that still counts
+    flaky, broken, stable, retired = [], [], [], []
+    for test_id, (outcomes, _first_seen, last_run) in sorted(
             by_test.items(), key=lambda kv: kv[1][1]):
         s = stats(outcomes)
         s["test_id"] = test_id
         s["quarantined"] = test_id in quarantined_ids
+        if last_run < horizon:
+            s["retired"] = True
+            s["last_run"] = last_run
+            retired.append(s)
+            continue
+        s["retired"] = False
         if s["runs"] < min_runs:
             continue  # not enough executed runs to say anything
         recovered = s["pass_streak"] >= stable_runs
@@ -115,4 +135,13 @@ def analyze(conn, min_runs: int = 5, stable_runs: int = 10,
             stable.append(s)
     flaky.sort(key=lambda s: (-s["flake_rate"], -s["failures"]))
     broken.sort(key=lambda s: -s["failures"])
-    return {"flaky": flaky, "broken": broken, "stable": stable}
+    retired.sort(key=lambda s: (-s["last_run"], s["test_id"]))
+    if retired:
+        commits = dict(conn.execute(
+            "SELECT id, commit_sha FROM runs WHERE id IN (%s)"
+            % ",".join("?" * len(retired)),
+            [s["last_run"] for s in retired]).fetchall())
+        for s in retired:
+            s["last_commit"] = commits.get(s["last_run"])
+    return {"flaky": flaky, "broken": broken, "stable": stable,
+            "retired": retired}
