@@ -480,6 +480,17 @@ def unquoted_variable_uses(script: str, names) -> list:
     return found
 
 
+def spaced_option_values(script: str) -> list:
+    """The `--option VALUE` pairs of a shell script whose VALUE starts with
+    an expansion (`--branch "$FB_BRANCH"`): two words. When the variable
+    holds something that starts with `-` the program reads it as the next
+    option, not as the value (`error: argument --branch: expected one
+    argument`). `--branch="$FB_BRANCH"` is one word, so it cannot be
+    misread. A literal value (`--format json`) is not reported."""
+    return [m.group(0) for m in re.finditer(
+        r'(?<![\w$-])-{1,2}[A-Za-z][\w-]*(?:[ \t]|\\\r?\n)+"?\$\S*', script)]
+
+
 class TestActionYml(unittest.TestCase):
     def test_structure(self):
         data = flat_yaml(action_text())
@@ -509,19 +520,24 @@ class TestActionYml(unittest.TestCase):
         parser = cli_mod.build_parser()
         subs = next(a for a in parser._actions
                     if isinstance(a, argparse_sub_type())).choices
-        found = 0
+        seen = set()
         for cmd, flags in re.findall(
-                r"python3 -m flakebox (\w+)((?:\s+(?:--[a-z-]+(?:\s+\"[^\"]*\")?))*)",
-                text):
+                r"python3 -m flakebox (\w+)((?:\s+--[a-z-]+(?:=\"[^\"]*\""
+                r"|\s+(?:\"[^\"]*\"|[^\s-]\S*))?)*)", text):
             self.assertIn(cmd, subs, f"unknown subcommand in action.yml: {cmd}")
             known = {o for a in subs[cmd]._actions for o in a.option_strings}
             for flag in re.findall(r"--[a-z-]+", flags):
-                found += 1
+                seen.add((cmd, flag))
                 self.assertIn(flag, known, f"`flakebox {cmd}` has no {flag}")
-        self.assertGreaterEqual(found, 4)
+        # every flag is seen, also the ones after `--format json`
+        expected = {("record", "--junit"), ("record", "--commit"),
+                    ("record", "--branch"), ("report", "--format"),
+                    ("report", "--min-runs"), ("quarantine", "--format"),
+                    ("quarantine", "--min-runs"), ("export", "--out")}
+        self.assertEqual(expected - seen, set(), "flags the scan missed")
         # the input that feeds a CLI flag must spell that flag, and reach
         # it through the environment, never pasted into the script
-        self.assertIn('--min-runs "$FB_MIN_RUNS"', text)
+        self.assertIn('--min-runs="$FB_MIN_RUNS"', text)
         self.assertIn("FB_MIN_RUNS: ${{ inputs.min-runs }}", text)
 
     def test_min_runs_input_feeds_a_valid_int(self):
@@ -677,19 +693,117 @@ class TestActionShellInjection(unittest.TestCase):
             # every hostile string arrived as exactly one argument
             self.assertEqual(calls, [
                 ["pip", "install", value],
-                ["python3", "-m", "flakebox", "record", "--junit", value,
-                 "--commit", value, "--branch", value],
-                ["python3", "-m", "flakebox", "report", "--min-runs", value],
+                ["python3", "-m", "flakebox", "record", f"--junit={value}",
+                 f"--commit={value}", f"--branch={value}"],
+                ["python3", "-m", "flakebox", "report", f"--min-runs={value}"],
                 ["python3", "-m", "flakebox", "report", "--format", "json",
-                 "--min-runs", value],
+                 f"--min-runs={value}"],
                 ["python3", "-m", "flakebox", "quarantine", "--format", "json",
-                 "--min-runs", value],
-                ["python3", "-m", "flakebox", "export", "--out", value]],
+                 f"--min-runs={value}"],
+                ["python3", "-m", "flakebox", "export", f"--out={value}"]],
                 f"for {value!r}")
             with open(output, encoding="utf-8") as f:
                 self.assertEqual(f.read(), "new_flaky=0\n")
             # the output paths are used as one file name each
             self.assertTrue(os.path.isfile(os.path.join(work, value)), value)
+
+
+class TestActionOptionValues(unittest.TestCase):
+    """R6 flakebox #1: `--branch "$FB_BRANCH"` is two shell words, so a
+    value that starts with `-` (a ref or a path can) reached argparse as a
+    second option: `argument --branch: expected one argument`, exit 2, a
+    failed step for a legal input. `--branch="$FB_BRANCH"` is one word and
+    one argument, whatever the value holds."""
+
+    def test_the_checker_sees_the_space_form(self):
+        for bad in ('flakebox record --junit "$FB_JUNIT"',
+                    'x --branch "${B}"', "x --out $FB_OUT",
+                    'x --min-runs "$(cat n)"', 'x -o "$D"', "x --out\t$D",
+                    'x --branch \\\n   "$B"'):
+            self.assertEqual(len(spaced_option_values(bad)), 1, bad)
+        self.assertEqual(spaced_option_values('a --x "$A" --y "$B"'),
+                         ['--x "$A"', '--y "$B"'])
+        for fine in ('x --branch="$B"', "x --format json", "x --min-runs 5",
+                     'mkdir -p -- "$(dirname -- "$D")"', 'echo "--> $X"',
+                     'x --a="$A" --b "lit"', 'x -- "$F"', 'cat "$F" | wc -l',
+                     'echo re-run "$X"', 'x --out="$(cat o)"'):
+            self.assertEqual(spaced_option_values(fine), [], fine)
+
+    def test_no_script_passes_a_variable_as_a_separate_word(self):
+        scripts = [s for s in action_steps(action_text())
+                   if s["run"] is not None]
+        self.assertGreaterEqual(len(scripts), 6)
+        for s in scripts:
+            self.assertEqual(
+                spaced_option_values(s["run"]), [],
+                f"step {s['name']!r}: write --option=\"$VAR\" (one word)")
+
+    def test_the_action_passes_every_value_option_as_one_word(self):
+        # the negative scan above must have something to look at
+        text = "\n".join(s["run"] for s in action_steps(action_text())
+                         if s["run"] is not None)
+        written = re.findall(r'(--[a-z-]+)="\$\w+"', text)
+        self.assertGreaterEqual(len(written), 7)
+        for flag in ("--junit", "--commit", "--branch", "--min-runs", "--out"):
+            self.assertIn(flag, written)
+
+    def test_the_documented_recipes_quote_their_values_too(self):
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        self.assertEqual(spaced_option_values(readme), [])
+        parser = cli_mod.build_parser()   # what `flakebox --help` prints
+        helps = [parser.format_help()] + [
+            sub.format_help() for a in parser._actions
+            if isinstance(a, argparse_sub_type()) for sub in a.choices.values()]
+        self.assertGreaterEqual(len(helps), 8)
+        for text in helps:
+            self.assertEqual(spaced_option_values(text), [])
+
+    @unittest.skipIf(os.name == "nt" or shutil.which("bash") is None,
+                     "runs the action's scripts under a POSIX bash")
+    def test_values_that_start_with_a_dash_are_recorded_and_exported(self):
+        """The action's own record and export steps, run for real (this
+        checkout's flakebox, no stub) with a `-` first in every value a
+        workflow can influence: a ref, a commit, a report path, an export
+        path."""
+        tmp = mktemp()
+        shims = os.path.join(tmp, "bin")
+        home = os.path.join(tmp, "home")
+        work = os.path.join(tmp, "work")
+        for d in (shims, home, work):
+            os.makedirs(d)
+        write_raw(shims, "python3",
+                  "#!/bin/sh\nexec %s \"$@\"\n" % shlex.quote(sys.executable))
+        os.chmod(os.path.join(shims, "python3"), 0o755)
+        write_raw(work, "-report.xml", JUNIT)
+        context = {"inputs.junit": "-report.xml", "github.sha": "-c0ffee",
+                   "github.ref_name": "-x", "inputs.export-output": "-out.json"}
+        steps = {s["name"]: s for s in action_steps(action_text())}
+
+        def run(name: str):
+            step = steps[name]
+            env = {"PATH": shims + os.pathsep + os.environ.get("PATH", ""),
+                   "HOME": home, "PYTHONPATH": REPO}
+            env.update({k: expand_expressions(v, context)
+                        for k, v in step["env"].items()})
+            return subprocess.run(
+                ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail",
+                 "-c", step["run"]],
+                cwd=work, env=env, capture_output=True, text=True, timeout=120)
+
+        proc = run("Record results")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("recorded run 1: 4 tests", proc.stdout)
+        proc = run("Export history (optional)")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        conn = store_mod.connect(os.path.join(home, ".flakebox", "history.db"))
+        try:
+            rows = conn.execute("SELECT commit_sha, branch FROM runs").fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(rows, [("-c0ffee", "-x")])
+        with open(os.path.join(work, "-out.json"), encoding="utf-8") as f:
+            self.assertEqual(len(json.load(f)["runs"]), 1)
 
 
 def argparse_sub_type():
@@ -1793,6 +1907,29 @@ class TestRetired(unittest.TestCase):
         code, out, _ = run_cli("--db", db, "history", "--test", "t::broken")
         self.assertIn("[retired", out)
 
+    def test_retire_after_zero_disables_retirement_in_history_too(self):
+        # documented as "0 disables"; `history` flagged EVERY test as
+        # retired with it (no recent run left to find the test in)
+        db = db_from_outcomes(mktemp(), {
+            "t::stable": ["passed"] * 25,
+            "t::broken": ["failed"] * 7 + [None] * 18,
+        })
+        code, out, _ = run_cli("--db", db, "history", "--test", "t::broken")
+        self.assertIn("[retired", out)           # the default: gone since run 7
+        for test in ("t::broken", "t::stable"):
+            for zero in ("0", "-1"):
+                code, out, _ = run_cli("--db", db, "history", "--test", test,
+                                       "--retire-after", zero)
+                self.assertEqual(code, 0)
+                self.assertNotIn("retired", out, f"{test} with {zero}")
+        conn = store_mod.connect(db)
+        self.assertFalse(detect_mod.summarize(conn, "t::stable",
+                                              retire_after=0)["retired"])
+        self.assertFalse(detect_mod.summarize(conn, "t::broken",
+                                              retire_after=0)["retired"])
+        self.assertTrue(detect_mod.summarize(conn, "t::broken")["retired"])
+        conn.close()
+
     def test_short_absence_is_not_retirement(self):
         # a partial run or two (someone ran one file) must not retire a test
         db = db_from_outcomes(mktemp(), {
@@ -2199,6 +2336,131 @@ class TestRecordDedupe(unittest.TestCase):
         self.assertTrue(sha.startswith(store_mod.LEGACY_PREFIX), sha)
 
 
+EMPTY_REPORTS = {
+    "empty suite": '<?xml version="1.0" encoding="utf-8"?>'
+                   '<testsuite name="pytest" tests="0" failures="0"/>',
+    "empty suites": "<testsuites/>",
+    "nested empty suites": "<testsuites><testsuite name='a'>"
+                           "<testsuite name='b'/></testsuite></testsuites>",
+    "output but no test": '<testsuite name="s"><system-out>collected 0 items'
+                          "</system-out></testsuite>",
+}
+
+
+class TestEmptyReport(unittest.TestCase):
+    """R6 flakebox #2: a report with no test cases is nearly always a test
+    step that broke (it died before it wrote results, a wrong path, a filter
+    that matched nothing). It was recorded as "0 tests", and "retired" means
+    "absent from the newest 3 runs": three of them in a row retired every
+    test, and `report` said "No flaky tests detected"."""
+
+    def record(self, tmp: str, db: str, xml: str, commit: str, *extra):
+        p = write_raw(tmp, f"{commit}.xml", xml)
+        return p, run_cli("--db", db, "record", "--junit", p,
+                          "--commit", commit, *extra)
+
+    def runs_in(self, db: str) -> int:
+        exp = db + ".json"
+        self.assertEqual(run_cli("--db", db, "export", "--out", exp)[0], 0)
+        with open(exp, encoding="utf-8") as f:
+            return len(json.load(f)["runs"])
+
+    def test_an_empty_report_is_warned_about_and_not_recorded(self):
+        tmp = mktemp()
+        db = os.path.join(tmp, "h.db")
+        for i, (name, xml) in enumerate(EMPTY_REPORTS.items()):
+            p, (code, out, err) = self.record(tmp, db, xml, f"c{i}")
+            self.assertEqual(code, 0, f"{name}: a docs-only build must pass")
+            self.assertEqual(out, "", name)
+            self.assertEqual(err.count("\n"), 1, f"{name}: one line: {err!r}")
+            for needle in ("warning", p, "no test cases", "not recorded",
+                           "--allow-empty"):
+                self.assertIn(needle, err, name)
+        self.assertEqual(self.runs_in(db), 0)
+
+    def test_allow_empty_records_it_anyway(self):
+        tmp = mktemp()
+        db = os.path.join(tmp, "h.db")
+        _, (code, out, err) = self.record(
+            tmp, db, EMPTY_REPORTS["empty suite"], "c0", "--allow-empty")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("recorded run 1: 0 tests, 0 failed/error", out)
+        self.assertEqual(self.runs_in(db), 1)
+        # it is a run like any other: the same report again is a duplicate
+        _, (code, out, _) = self.record(
+            tmp, db, EMPTY_REPORTS["empty suite"], "c0", "--allow-empty")
+        self.assertIn("already recorded as run 1", out)
+
+    def test_three_empty_reports_no_longer_retire_every_test(self):
+        tmp = mktemp()
+        db = os.path.join(tmp, "h.db")
+        record_runs(tmp, db)   # 6 real runs: one flaky, one broken, one stable
+        for i in range(3):
+            _, (code, _, _) = self.record(
+                tmp, db, EMPTY_REPORTS["empty suite"], f"empty{i}")
+            self.assertEqual(code, 0)
+        self.assertEqual(self.runs_in(db), 6)
+        code, out, _ = run_cli("--db", db, "report", "--format", "json")
+        a = json.loads(out)
+        self.assertEqual([s["test_id"] for s in a["flaky"]],
+                         ["tests.test_a.TestA::test_flaky"])
+        self.assertEqual([s["test_id"] for s in a["broken"]],
+                         ["tests.test_b::test_broken"])
+        self.assertEqual(a["retired"], [])
+        code, out, _ = run_cli("--db", db, "report")
+        self.assertNotIn("No flaky tests detected", out)
+        self.assertNotIn("## Retired", out)
+
+    def test_with_allow_empty_an_empty_run_counts_like_any_other(self):
+        # what the flag means, said out loud: recorded, so "absent from the
+        # newest 3 runs" is true of every test
+        tmp = mktemp()
+        db = os.path.join(tmp, "h.db")
+        record_runs(tmp, db)
+        for i in range(3):
+            self.record(tmp, db, EMPTY_REPORTS["empty suite"], f"empty{i}",
+                        "--allow-empty")
+        self.assertEqual(self.runs_in(db), 9)
+        code, out, _ = run_cli("--db", db, "report", "--format", "json")
+        a = json.loads(out)
+        self.assertEqual(a["flaky"], [])
+        self.assertEqual(sorted(s["test_id"] for s in a["retired"]),
+                         ["tests.test_a.TestA::test_flaky",
+                          "tests.test_a.TestA::test_stable",
+                          "tests.test_b::test_broken",
+                          "tests.test_b::test_skip"])
+
+    def test_a_report_of_skipped_tests_is_not_empty(self):
+        tmp = mktemp()
+        db = os.path.join(tmp, "h.db")
+        xml = ('<testsuite><testcase classname="a" name="t"><skipped/>'
+               "</testcase></testsuite>")
+        _, (code, out, err) = self.record(tmp, db, xml, "c0")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("recorded run 1: 1 tests", out)
+
+    def test_a_report_that_cannot_be_read_is_still_an_error(self):
+        tmp = mktemp()
+        db = os.path.join(tmp, "h.db")
+        _, (code, _, err) = self.record(tmp, db, "not xml", "c0",
+                                        "--allow-empty")
+        self.assertEqual(code, 2)
+        self.assertIn("cannot parse", err)
+
+    def test_help_and_readme_say_so(self):
+        subs = next(a for a in cli_mod.build_parser()._actions
+                    if isinstance(a, argparse_sub_type())).choices
+        helped = " ".join(subs["record"].format_help().split())
+        self.assertIn("--allow-empty", helped)
+        self.assertIn("no test cases", helped)
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            readme = " ".join(f.read().split())
+        for needle in ("A report with no test cases at all", "is not recorded",
+                       "--allow-empty", "exits 0", "retire the whole suite",
+                       "a report with no test cases is warned about"):
+            self.assertTrue(needle in readme, f"README lacks {needle!r}")
+
+
 class TestDbFlagPosition(unittest.TestCase):
     """F-7: --db works after the subcommand as well as before it."""
 
@@ -2267,6 +2529,23 @@ class TestDocsAndDeadCode(unittest.TestCase):
         self.assertNotIn("survives `pytest $(...)` as one argument", flat)
         # no usage line runs the substitution bare
         self.assertNotRegex(raw, r"(?m)^pytest \$\(")
+
+    def test_readme_says_the_powershell_command_is_untested(self):
+        """R6 flakebox #3: nobody has run the Invoke-Expression recipe on
+        PowerShell, and the Windows line is quoted for cmd.exe."""
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            raw = f.read()
+        paragraphs = [" ".join(p.split()) for p in raw.split("\n\n")]
+        [recipe] = [p for p in paragraphs if "Invoke-Expression" in p]
+        for needle in ("untested", "quoted for `cmd.exe`", "parse those itself",
+                       "use the plugin"):
+            self.assertTrue(needle in recipe, f"the recipe paragraph lacks {needle!r}")
+        limits = raw.split("## Limitations")[1].split("## Tests")[0]
+        bullets = [" ".join(b.split()) for b in limits.split("\n- ")]
+        [guess] = [b for b in bullets
+                   if b.startswith("**`--format deselect` is a guess**")]
+        self.assertIn("PowerShell", guess)
+        self.assertIn("untested", guess)
 
 
 # ---------------------------------------------------------------------------
@@ -2366,6 +2645,23 @@ class TestDeselectQuoting(unittest.TestCase):
                          "--deselect m.py::T::test_a")
         self.assertEqual(quar_mod.deselect_line(["pkg.mod::test_a"]),
                          "--deselect pkg/mod.py::test_a")
+
+    def test_the_windows_line_is_cmd_quoting_that_leaves_powershell_syntax_bare(self):
+        """R6 flakebox #3: the README says the Windows line is quoted for
+        cmd.exe and leaves these characters bare for PowerShell to parse. If
+        the quoting ever changes, that sentence must change with it."""
+        ids = ["tests.t::test_x[a;b]", "tests.t::test_x[a&b]",
+               "tests.t::test_x[1,2]", "tests.t::test_x[$(calc)]",
+               "tests.t::test_x[`c`]", "tests.t::test_x[(a)]",
+               "tests.t::test_x[a|b]"]
+        with mock.patch.object(os, "name", "nt"):  # deselect_line asks at call time
+            line = quar_mod.deselect_line(ids)
+            spaced = quar_mod.deselect_line(["tests.t::test_x[a b]"])
+        for tid in ids:
+            node = quar_mod.pytest_nodeid(tid)
+            self.assertIn(" " + node, line)
+            self.assertNotIn('"' + node + '"', line)
+        self.assertIn('"tests/t.py::test_x[a b]"', spaced)  # only whitespace is quoted
 
     def test_cli_output_round_trips_through_the_shell(self):
         tmp = mktemp()

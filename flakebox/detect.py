@@ -91,8 +91,11 @@ def summarize(conn, test_id: str, window: int = 50,
     s = stats([h["outcome"] for h in hist], stable_runs)
     s["test_id"] = test_id
     s["quarantined"] = store_mod.is_quarantined(conn, test_id)
-    s["retired"] = bool(hist) and test_id not in store_mod.active_test_ids(
-        conn, retire_after)
+    # retire_after 0 disables retirement, as it does for analyze(): with no
+    # recent runs to look in, every test would otherwise be "absent"
+    s["retired"] = (retire_after > 0 and bool(hist)
+                    and test_id not in store_mod.active_test_ids(
+                        conn, retire_after))
     return s
 
 

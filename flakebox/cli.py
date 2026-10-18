@@ -3,7 +3,7 @@
 Ingests JUnit XML, detects flakiness statistically, quarantines the
 flakes, and tells you when they're stable enough to come back.
 
-  flakebox record --junit reports/junit.xml --commit $SHA
+  flakebox record --junit reports/junit.xml --commit="$SHA"
   flakebox report                        # flaky / broken / stable tables
   flakebox quarantine --format pytest -o .   # skip flakes in CI
   flakebox unquarantine --test pkg.Class::test_x
@@ -28,7 +28,7 @@ from . import junit as junit_mod
 from . import quarantine as quar_mod
 from . import store as store_mod
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 
 
 def default_db() -> str:
@@ -69,6 +69,15 @@ def cmd_record(args) -> int:
         print(f"error: cannot parse {args.junit}: {e}", file=sys.stderr)
         return 2
     sha = junit_mod.report_sha256(raw)
+    if not results and not args.allow_empty:
+        # Nearly always a test step that broke. Recorded, a run with no
+        # tests makes every test look absent, and three of them in a row
+        # retire the whole suite. Exit 0 all the same: a build that really
+        # ran no tests (docs only) is not a failure.
+        junit_mod._warn(f"{args.junit} has no test cases, so it was not "
+                        f"recorded (a test step that broke looks like this; "
+                        f"--allow-empty records it anyway)")
+        return 0
     conn = _db(args.db)
     try:
         if not args.force:
@@ -298,6 +307,11 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--force", action="store_true",
                    help="record even if this exact report (same commit, "
                         "same bytes) was recorded before")
+    r.add_argument("--allow-empty", action="store_true",
+                   help="record a report that has no test cases. By default "
+                        "it is not recorded (a warning on stderr, exit 0): "
+                        "it is nearly always a test step that broke, and "
+                        "three of them in a row retire every test")
 
     rp = sub.add_parser("report", parents=[common, detect],
                         help="Flaky / broken / stable / retired tables.")

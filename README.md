@@ -20,7 +20,7 @@ flakebox --version
 
 ```bash
 # in CI, after your test step (pytest --junitxml=reports/junit.xml):
-flakebox record --junit reports/junit.xml --commit $GITHUB_SHA
+flakebox record --junit reports/junit.xml --commit="$GITHUB_SHA"
 
 # what is flaky?
 flakebox report
@@ -66,6 +66,17 @@ instead of rejecting the report. A report that declares a `DOCTYPE` or an
 expanded; text that merely mentions `<!DOCTYPE html>`, such as captured
 output in a CDATA section, is fine.
 
+A report with no test cases at all (`<testsuite tests="0"/>`, or a file
+written before the tests ran) is not recorded. It is nearly always a test
+step that broke, and a run without tests makes every test look absent:
+three of them in a row retire the whole suite, and `report` says "No flaky
+tests detected". `record` prints a warning on stderr and exits 0, so a
+build that really ran no tests (docs only) is not failed. `--allow-empty`
+records the report anyway; it then counts like any other run. Empty runs
+that an earlier flakebox recorded stay in the history (there is no
+command to delete a run) and stop mattering once `--retire-after` (3) real
+runs have followed, or at once with `--retire-after 0`.
+
 `flakebox quarantine` is idempotent and safe to run on every build: it
 adds the current flaky set (never re-stamping tests already in
 quarantine) and always emits the **whole** quarantine set, not just the
@@ -89,8 +100,12 @@ $(flakebox quarantine --format deselect)` does not: command
 substitution splits the output at whitespace and never removes the
 quotes in it, so an id with a space or a shell character arrives in
 pieces with the quotes still attached (ids without either are fine).
-PowerShell has no `$(...)` word splitting — use `Invoke-Expression
-"pytest $(flakebox quarantine --format deselect)"`, or the plugin.
+PowerShell has no `$(...)` word splitting, so `Invoke-Expression "pytest
+$(flakebox quarantine --format deselect)"` is the counterpart of `eval`,
+but it is **untested**: the Windows line is quoted for `cmd.exe`, which
+leaves `;`, `&`, `,`, `$`, backticks and parentheses bare, and PowerShell
+may parse those itself (an id that contains one may be split, or even
+run). If an id can contain one, use the plugin.
 
 Parametrised ids are matched whole by the plugin: quarantining
 `test_version[1.5]` skips exactly that case, never `test_unrelated[0.5]`
@@ -211,7 +226,7 @@ artifact-ready files.
 
 | input               | default    | what it does                                  |
 |---------------------|------------|-----------------------------------------------|
-| `junit`             | (required) | path to the JUnit XML → `flakebox record --junit` |
+| `junit`             | (required) | path to the JUnit XML → `flakebox record --junit` (a report with no test cases is warned about, not recorded) |
 | `db-key`            | `flakebox` | cache key prefix for the history DB           |
 | `min-runs`          | `5`        | executed runs before "flaky" → `flakebox report --min-runs` |
 | `fail-on-flaky`     | `false`    | fail the step when flaky tests are found that are not quarantined |
@@ -250,9 +265,13 @@ export).
 branch named `x";touch${IFS}pwned;echo"y` (a legal git ref) would run a
 command in your job. The action passes every input and `github.*` value
 through the step's `env:` and reads it as a quoted variable
-(`"$FB_BRANCH"`), so the shell only ever sees a string. The test suite
-scans `action.yml` for `${{` inside any `run:` and runs each script under
-bash with hostile values. The two `actions/cache` steps are first-party
+(`"$FB_BRANCH"`), so the shell only ever sees a string. Each option takes
+its value as one word, `--branch="$FB_BRANCH"`, so a value that starts
+with `-` (a ref or a path can) is still that option's value and never the
+start of another option. The test suite scans `action.yml` for `${{`
+inside any `run:` and for an option and its value written as two words,
+and runs each script under bash with hostile values and with values that
+start with `-`. The two `actions/cache` steps are first-party
 and use the `v4` tag, not a commit SHA; pin them in a fork if your policy
 requires it.
 
@@ -263,8 +282,8 @@ requires it.
   the same second tie and fall back to the order they were added, and
   machines whose clocks disagree order their merged runs by those clocks.
 - **`--format deselect` is a guess** at pytest node ids (see above); the
-  generated plugin is the reliable path, and `eval` is needed for ids with
-  a space or a shell character.
+  generated plugin is the reliable path, `eval` is needed for ids with a
+  space or a shell character, and the PowerShell form is untested.
 - **Any DOCTYPE is refused**, harmless or not: JUnit reports never need
   one, and refusing them all keeps the XML-bomb check simple.
 - **The Action's cache steps use the `v4` tag**, not a commit SHA (above).

@@ -99,6 +99,11 @@ runs:
     # `${{` inside a `run:` and runs each script under bash with hostile
     # values; keep both true when you add a step.
     #
+    # An option takes such a value as ONE shell word, --branch="$FB_BRANCH",
+    # never --branch "$FB_BRANCH": a value that starts with "-" (a ref or a
+    # path can) would be read as the next option, and the step would fail
+    # with "expected one argument". The same tests fail on the two-word form.
+    #
     # The two actions/cache steps (restore above, save below) are
     # first-party and referenced by their major tag (v4), not by a commit
     # SHA. Pin them to a SHA in a fork if your policy requires it.
@@ -117,9 +122,9 @@ runs:
         FB_BRANCH: ${{ github.ref_name }}
       run: >
         python3 -m flakebox record
-        --junit "$FB_JUNIT"
-        --commit "$FB_COMMIT"
-        --branch "$FB_BRANCH"
+        --junit="$FB_JUNIT"
+        --commit="$FB_COMMIT"
+        --branch="$FB_BRANCH"
 
     - name: Report
       id: report
@@ -127,8 +132,8 @@ runs:
       env:
         FB_MIN_RUNS: ${{ inputs.min-runs }}
       run: |
-        python3 -m flakebox report --min-runs "$FB_MIN_RUNS" >> "$GITHUB_STEP_SUMMARY"
-        N_NEW=$(python3 -m flakebox report --format json --min-runs "$FB_MIN_RUNS" | python3 -c "
+        python3 -m flakebox report --min-runs="$FB_MIN_RUNS" >> "$GITHUB_STEP_SUMMARY"
+        N_NEW=$(python3 -m flakebox report --format json --min-runs="$FB_MIN_RUNS" | python3 -c "
         import json, sys
         flaky = json.load(sys.stdin)['flaky']
         print(sum(1 for t in flaky if not t['quarantined']))
@@ -146,7 +151,7 @@ runs:
         FB_QUARANTINE_OUTPUT: ${{ inputs.quarantine-output }}
       run: |
         mkdir -p -- "$(dirname -- "$FB_QUARANTINE_OUTPUT")"
-        python3 -m flakebox quarantine --format json --min-runs "$FB_MIN_RUNS" > "$FB_QUARANTINE_OUTPUT"
+        python3 -m flakebox quarantine --format json --min-runs="$FB_MIN_RUNS" > "$FB_QUARANTINE_OUTPUT"
         echo "quarantine set written to $FB_QUARANTINE_OUTPUT" >> "$GITHUB_STEP_SUMMARY"
 
     - name: Export history (optional)
@@ -156,7 +161,7 @@ runs:
         FB_EXPORT_OUTPUT: ${{ inputs.export-output }}
       run: |
         mkdir -p -- "$(dirname -- "$FB_EXPORT_OUTPUT")"
-        python3 -m flakebox export --out "$FB_EXPORT_OUTPUT"
+        python3 -m flakebox export --out="$FB_EXPORT_OUTPUT"
 
     - name: Fail on new flakes (optional)
       if: inputs.fail-on-flaky == 'true' && steps.report.outputs.new_flaky != '0'
