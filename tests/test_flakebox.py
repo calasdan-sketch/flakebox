@@ -22,7 +22,9 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -244,7 +246,7 @@ class TestQuarantineFiles(unittest.TestCase):
         self.assertEqual(args, ["--deselect", "a.py::t1", "--deselect", "b.py::t2"])
 
     def test_matches_id_formats(self):
-        m = exec_plugin(mktemp(), ["test_demo.TestDemo::test_flaky"])["_matches"]
+        m = plugin_matches
         # JUnit-style vs pytest nodeid
         self.assertTrue(m("test_demo.py::TestDemo::test_flaky",
                           "test_demo.TestDemo::test_flaky"))
@@ -1454,17 +1456,25 @@ class TestQuarantineMatchesClassless(unittest.TestCase):
     """FIX A: classless node IDs (test_mod.py::test_x) must match."""
 
     def setUp(self):
-        self.m = exec_plugin(mktemp(), ["placeholder::x"])["_matches"]
+        self.m = plugin_matches
 
     def test_classless_matches_both_directions(self):
         self.assertTrue(self.m("test_mod.py::test_x", "test_mod::test_x"))
         self.assertTrue(self.m("test_mod::test_x", "test_mod.py::test_x"))
 
     def test_classless_matches_dotted_junit_variant(self):
-        self.assertTrue(self.m("tests/test_mod.py::test_x",
+        # the same file seen from another rootdir: one id is a tail of the other
+        self.assertTrue(self.m("pkg/test_mod.py::test_x",
+                               "pkg.test_mod::test_x"))
+        self.assertTrue(self.m("test_mod.py::test_x",
                                "pkg.test_mod::test_x"))
         self.assertTrue(self.m("pkg.test_mod::test_x",
-                               "tests/test_mod.py::test_x"))
+                               "test_mod.py::test_x"))
+        # another directory is another test (the plugin used to skip it too)
+        self.assertFalse(self.m("tests/test_mod.py::test_x",
+                                "pkg.test_mod::test_x"))
+        self.assertFalse(self.m("pkg.test_mod::test_x",
+                                "tests/test_mod.py::test_x"))
 
     def test_class_based_still_matches(self):
         self.assertTrue(self.m("test_demo.py::TestDemo::test_flaky",
@@ -2566,17 +2576,19 @@ PARAM_TESTS = (
 )
 
 
-def pytest_outcomes(cwd: str, extra: list) -> dict:
-    """Run real pytest on `cwd`/tests and return {junit id: outcome}."""
+def pytest_outcomes(cwd: str, extra: list, targets=("tests",),
+                    ok=(0, 5)) -> dict:
+    """Run real pytest on `targets` under `cwd` and return
+    {junit id: outcome}; `ok` are the exit codes that are not a surprise."""
     report = os.path.join(cwd, "j.xml")
     if os.path.exists(report):
         os.remove(report)
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-         "--junitxml", report, "tests"] + extra,
+         "--junitxml", report] + list(targets) + extra,
         cwd=cwd, capture_output=True, text=True, timeout=120,
         env=child_env(PYTHONDONTWRITEBYTECODE="1"))
-    assert proc.returncode in (0, 5), proc.stdout + proc.stderr
+    assert proc.returncode in ok, proc.stdout + proc.stderr
     return {r["test_id"]: r["outcome"] for r in junit_mod.parse(report)}
 
 
@@ -2586,7 +2598,7 @@ class TestParametrisedIds(unittest.TestCase):
     too (a false green)."""
 
     def test_matcher_keeps_parameters_whole(self):
-        m = exec_plugin(mktemp(), ["placeholder::x"])["_matches"]
+        m = plugin_matches
         self.assertTrue(m("tests/test_c.py::test_version[1.5]",
                           "tests.test_c::test_version[1.5]"))
         self.assertFalse(m("tests/test_c.py::test_unrelated[0.5]",
@@ -2619,6 +2631,554 @@ class TestParametrisedIds(unittest.TestCase):
             "tests.test_c::test_param[a b]": "skipped",
             "tests.test_c::test_param[c.d/e]": "passed",
             "tests.test_c::test_plain": "passed"})
+
+
+# ---------------------------------------------------------------------------
+# Round 7 panel findings: the generated plugin matches the whole path
+# ---------------------------------------------------------------------------
+
+_PLUGINS: dict = {}
+
+
+def plugin_matches(nodeid: str, quarantined: str) -> bool:
+    """Does the generated plugin quarantine the test with pytest node id
+    `nodeid` when `quarantined` (a JUnit id) is the only id in the set?
+    One real plugin per quarantined id, loaded once."""
+    ns = _PLUGINS.get(quarantined)
+    if ns is None:
+        ns = _PLUGINS[quarantined] = exec_plugin(mktemp(), [quarantined])
+    return bool(ns["_is_quarantined"](nodeid))
+
+
+class TestPluginMatchesTheWholePath(unittest.TestCase):
+    """R7 flakebox #2: the plugin compared only the last two `::` segments,
+    so a healthy `pkg_b/test_util.py::test_x` was skipped because
+    `pkg_a.test_util::test_x` was quarantined, while the README called the
+    plugin "the reliable path"."""
+
+    def test_the_same_test_name_in_another_package_is_left_alone(self):
+        q = "pkg_a.test_util::test_x"
+        self.assertTrue(plugin_matches("pkg_a/test_util.py::test_x", q))
+        self.assertFalse(plugin_matches("pkg_b/test_util.py::test_x", q))
+        self.assertFalse(plugin_matches("pkg_a/test_other.py::test_x", q))
+        self.assertFalse(plugin_matches("pkg_a/test_util.py::test_y", q))
+
+    def test_the_same_module_name_in_another_package_is_left_alone(self):
+        q = "pkg_a.test_util.TestK::test_y"
+        self.assertTrue(plugin_matches("pkg_a/test_util.py::TestK::test_y", q))
+        self.assertFalse(plugin_matches("pkg_b/test_util.py::TestK::test_y", q))
+        self.assertFalse(plugin_matches("pkg_a/test_util.py::TestJ::test_y", q))
+        q = "pkg.test_m.Outer.Inner::test_z"
+        self.assertTrue(plugin_matches("pkg/test_m.py::Outer::Inner::test_z", q))
+        self.assertFalse(plugin_matches("pkg/test_m.py::Inner::test_z", q))
+        self.assertFalse(plugin_matches("pkg/test_m.py::Other::Inner::test_z", q))
+
+    def test_a_rootdir_that_differs_between_ci_and_local_still_matches(self):
+        # CI ran from the repository root, this run is rooted inside tests/
+        self.assertTrue(plugin_matches("test_mod.py::test_x",
+                                       "tests.test_mod::test_x"))
+        self.assertTrue(plugin_matches("test_mod.py::TestA::test_x",
+                                       "tests.test_mod.TestA::test_x"))
+        # CI ran inside tests/, this run is rooted at the repository
+        self.assertTrue(plugin_matches("tests/test_mod.py::test_x",
+                                       "test_mod::test_x"))
+        self.assertTrue(plugin_matches("src/pkg/tests/test_mod.py::TestA::test_x",
+                                       "test_mod.TestA::test_x"))
+        # a junit prefix in front of the classname
+        self.assertTrue(plugin_matches("tests/test_mod.py::test_x",
+                                       "ci.tests.test_mod::test_x"))
+        # ... but when the shorter id is the recorded one, it cannot tell
+        # which package it came from, and every test that ends like it matches
+        self.assertTrue(plugin_matches("pkg_a/test_util.py::test_x",
+                                       "test_util::test_x"))
+        self.assertTrue(plugin_matches("pkg_b/test_util.py::test_x",
+                                       "test_util::test_x"))
+
+    def test_a_different_directory_is_a_different_test(self):
+        self.assertFalse(plugin_matches("tests/test_mod.py::test_x",
+                                        "pkg.test_mod::test_x"))
+        self.assertFalse(plugin_matches("other/tests/test_mod.py::test_x",
+                                        "pkg.tests.test_mod::test_x"))
+        # a class where the other side has none is not the same test
+        self.assertFalse(plugin_matches("test_mod.py::TestA::test_x",
+                                        "tests.test_mod::test_x"))
+        self.assertFalse(plugin_matches("tests/test_mod.py::test_x",
+                                        "tests.test_mod.TestA::test_x"))
+
+    def test_components_are_compared_whole_not_as_text(self):
+        q = "pkg.test_util::test_x"
+        self.assertFalse(plugin_matches("mypkg/test_util.py::test_x", q))
+        self.assertFalse(plugin_matches("pkg/xtest_util.py::test_x", q))
+        self.assertFalse(plugin_matches("pkg/test_util.py::test_xy", q))
+        self.assertFalse(plugin_matches("pkg/test_util.py::xtest_x", q))
+
+    def test_a_dotted_directory_name_matches_its_junit_classname(self):
+        # pytest writes `/` as `.` in the classname, so `my.pkg` and
+        # `my/pkg` cannot be told apart there; both are three components
+        self.assertTrue(plugin_matches("my.pkg/test_a.py::test_x",
+                                       "my.pkg.test_a::test_x"))
+        self.assertTrue(plugin_matches("my/pkg/test_a.py::test_x",
+                                       "my.pkg.test_a::test_x"))
+
+    def test_the_path_separator_does_not_matter(self):
+        self.assertTrue(plugin_matches("pkg\\test_a.py::test_x",
+                                       "pkg.test_a::test_x"))
+        self.assertTrue(plugin_matches("pkg/test_a.py::test_x",
+                                       "pkg\\test_a.py::test_x"))
+
+    def test_parameters_belong_to_the_name(self):
+        q = "pkg_a.test_util::test_p[1.5]"
+        self.assertTrue(plugin_matches("pkg_a/test_util.py::test_p[1.5]", q))
+        self.assertFalse(plugin_matches("pkg_b/test_util.py::test_p[1.5]", q))
+        self.assertFalse(plugin_matches("pkg_a/test_util.py::test_p[2.0]", q))
+        self.assertFalse(plugin_matches("pkg_a/test_util.py::test_p", q))
+        # `::`, `/` and `.` inside the brackets are parameter text, not path
+        q = "pkg_a.test_util::test_p[a::b/c.d]"
+        self.assertTrue(plugin_matches("pkg_a/test_util.py::test_p[a::b/c.d]", q))
+        self.assertFalse(plugin_matches("pkg_a/test_util.py::test_p[c.d]", q))
+        self.assertFalse(plugin_matches("pkg_b/test_util.py::test_p[a::b/c.d]", q))
+        q = "pkg_a.test_util.TestK::test_p[1.5]"
+        self.assertTrue(plugin_matches("pkg_a/test_util.py::TestK::test_p[1.5]", q))
+        self.assertFalse(plugin_matches("pkg_b/test_util.py::TestK::test_p[1.5]", q))
+        # a backslash inside the brackets is parameter text, not a separator
+        q = "pkg_a.test_util::test_p[a\\b]"
+        self.assertTrue(plugin_matches("pkg_a/test_util.py::test_p[a\\b]", q))
+        self.assertFalse(plugin_matches("pkg_a/test_util.py::test_p[a/b]", q))
+
+    def test_an_id_without_a_module_is_not_a_wildcard(self):
+        for q in ("test_x", "::test_x", ".::test_x"):
+            self.assertFalse(plugin_matches("tests/test_a.py::test_x", q), q)
+            self.assertFalse(plugin_matches("test_x", q), q)
+
+    def test_the_readme_states_the_rule_and_its_limits(self):
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            flat = " ".join(f.read().split())
+        for needle in ("by name and by whole path components",
+                       "`pkg_a/test_util.py::test_x` is never "
+                       "`pkg_b/test_util.py::test_x`",
+                       "lack leading directories",
+                       "record and test from the same rootdir",
+                       "is a *prefix* match",
+                       "no timestamp"):
+            self.assertIn(needle, flat)
+        self.assertNotIn("suffix-matches", flat)
+
+
+def pairwise_match(key, a: str, b: str) -> bool:
+    """The rule, stated for two ids (slow, obviously right): same name, and
+    the shorter module/class chain is the tail of the longer one."""
+    ka, kb = key(a), key(b)
+    if ka is None or kb is None or ka[0] != kb[0]:
+        return False
+    short, longer = sorted((ka[1], kb[1]), key=len)
+    return longer[len(longer) - len(short):] == short
+
+
+class TestPluginIndex(unittest.TestCase):
+    """R7 flakebox #6: collection compared every test with every quarantined
+    id (500 tests x 5,000 ids = 7.5 s per pytest run). The plugin now looks
+    each test up in a set; the answer must not change."""
+
+    DIRS = ("pkg", "tests", "src")
+    MODULES = ("test_a", "test_b")
+    CLASSES = ("TestK", "TestJ")
+    NAMES = ("test_x", "test_y", "test_x[1.5]", "test_x[a::b]")
+
+    def random_spec(self, rng) -> tuple:
+        return ([rng.choice(self.DIRS) for _ in range(rng.randint(0, 3))],
+                rng.choice(self.MODULES),
+                [rng.choice(self.CLASSES) for _ in range(rng.randint(0, 2))],
+                rng.choice(self.NAMES))
+
+    def render(self, rng, spec) -> str:
+        dirs, module, classes, name = spec
+        if rng.random() < 0.5:                       # a JUnit id
+            return ".".join(dirs + [module] + classes) + "::" + name
+        return "/".join(dirs + [module + ".py"]) + "::" + "::".join(classes + [name])
+
+    def neighbour(self, rng, spec) -> tuple:
+        """A spec close to `spec`: leading directories dropped or added, now
+        and then another module, class or name (so most are hits, some not)."""
+        dirs, module, classes, name = spec
+        dirs = dirs[rng.randint(0, len(dirs)):]
+        if rng.random() < 0.4:
+            dirs = [rng.choice(self.DIRS)] + dirs
+        if rng.random() < 0.15:
+            module = rng.choice(self.MODULES)
+        if rng.random() < 0.15:
+            classes = [rng.choice(self.CLASSES)] + classes[1:]
+        if rng.random() < 0.15:
+            name = rng.choice(self.NAMES)
+        return dirs, module, classes, name
+
+    def test_the_lookup_gives_the_answer_of_the_pairwise_rule(self):
+        rng = random.Random(20261018)
+        seen = {True: 0, False: 0}
+        for _ in range(60):
+            specs = [self.random_spec(rng) for _ in range(rng.randint(1, 6))]
+            quarantined = sorted({self.render(rng, s) for s in specs})
+            ns = exec_plugin(mktemp(), quarantined)
+            for _ in range(40):
+                spec = (rng.choice(specs) if rng.random() < 0.7
+                        else self.random_spec(rng))
+                item = self.render(rng, self.neighbour(rng, spec))
+                want = any(pairwise_match(ns["_key"], item, q)
+                           for q in quarantined)
+                self.assertEqual(ns["_is_quarantined"](item), want,
+                                 (item, quarantined))
+                seen[want] += 1
+        self.assertGreater(seen[True], 500)    # the corpus hits both ways
+        self.assertGreater(seen[False], 500)
+
+    def test_collection_cost_does_not_grow_with_the_quarantine_set(self):
+        quarantined = [f"pkg{i % 40}.test_m{i % 7}.TestK::test_t{i}"
+                       for i in range(5000)]
+        ns = exec_plugin(mktemp(), quarantined)
+        hits = [f"pkg{i % 40}/test_m{i % 7}.py::TestK::test_t{i}"
+                for i in range(0, 5000, 25)]
+        misses = [f"pkg{i % 40}/test_m{i % 7}.py::TestK::test_u{i}"
+                  for i in range(0, 5000, 25)]
+        items = [_Item(n) for n in hits + misses]
+        keyed, scans = [], []
+        real_key = ns["_key"]
+        ns["_key"] = lambda tid: keyed.append(tid) or real_key(tid)
+
+        class Watched(list):
+            def __iter__(self):
+                scans.append(1)
+                return super().__iter__()
+
+        ns["QUARANTINED"] = Watched(ns["QUARANTINED"])
+        started = time.perf_counter()
+        ns["pytest_collection_modifyitems"](items)
+        elapsed = time.perf_counter() - started
+        self.assertEqual([bool(i.markers) for i in items],
+                         [True] * len(hits) + [False] * len(misses))
+        # one key per collected test, however many ids are quarantined,
+        # and the set is never walked while collecting
+        self.assertLessEqual(len(keyed), len(items))
+        self.assertEqual(scans, [])
+        # the old plugin needed 7 s for this; the bound is loose on purpose
+        self.assertLess(elapsed, 3.0, f"collection took {elapsed:.1f}s")
+
+
+class TestRegeneratedPluginIsStable(unittest.TestCase):
+    """R7 flakebox #7: `generated_at` made "regenerate and commit" show a
+    diff for a quarantine set that had not changed."""
+
+    NAMES = ("flakebox_quarantine.json", "flakebox_quarantine.py")
+
+    def read_all(self, tmp: str) -> dict:
+        out = {}
+        for name in self.NAMES:
+            with open(os.path.join(tmp, name), "rb") as f:
+                out[name] = f.read()
+        return out
+
+    def test_regenerating_an_unchanged_set_writes_identical_files(self):
+        ids = ["pkg.test_a::test_x", "pkg.test_a.TestK::test_y"]
+        tmp = mktemp()
+        with mock.patch("time.time", return_value=1_000_000_000.0):
+            quar_mod.write_pytest(tmp, ids)
+        before = self.read_all(tmp)
+        with mock.patch("time.time", return_value=2_000_000_000.0):
+            quar_mod.write_pytest(tmp, list(reversed(ids)))
+        self.assertEqual(self.read_all(tmp), before)
+        data = json.loads(before["flakebox_quarantine.json"].decode("utf-8"))
+        self.assertNotIn("generated_at", data)
+        self.assertEqual(sorted(data), ["count", "mode", "tests"])
+
+    def test_the_command_is_stable_too(self):
+        tmp = mktemp()
+        db = make_db(tmp)
+        with mock.patch("time.time", return_value=1_000_000_000.0):
+            self.assertEqual(run_cli("--db", db, "quarantine", "--format",
+                                     "pytest", "-o", tmp)[0], 0)
+        before = self.read_all(tmp)
+        with mock.patch("time.time", return_value=2_000_000_000.0):
+            self.assertEqual(run_cli("--db", db, "quarantine", "--format",
+                                     "pytest", "-o", tmp)[0], 0)
+        self.assertEqual(self.read_all(tmp), before)
+
+
+SAME_NAMES_FLAKY = (
+    "import pytest\n\n\n"
+    "def test_x():\n    assert False, 'flaky'\n\n\n"
+    "class TestK:\n"
+    "    def test_y(self):\n        assert False, 'flaky'\n\n\n"
+    "@pytest.mark.parametrize('v', ['1.5', '2.0'])\n"
+    "def test_p(v):\n    assert v != '1.5', 'flaky'\n")
+SAME_NAMES_HEALTHY = (
+    "import pytest\n\n\n"
+    "def test_x():\n    pass\n\n\n"
+    "class TestK:\n"
+    "    def test_y(self):\n        pass\n\n\n"
+    "@pytest.mark.parametrize('v', ['1.5', '2.0'])\n"
+    "def test_p(v):\n    pass\n")
+
+
+def make_two_package_project(tmp: str) -> None:
+    """pkg_a (flaky) and pkg_b (healthy) with the same module and test names;
+    pkg_a also has a module of its own."""
+    for pkg, source in (("pkg_a", SAME_NAMES_FLAKY), ("pkg_b", SAME_NAMES_HEALTHY)):
+        d = os.path.join(tmp, pkg)
+        os.makedirs(d)
+        write_raw(d, "__init__.py", "")
+        write_raw(d, "test_util.py", source)
+    write_raw(os.path.join(tmp, "pkg_a"), "test_only_a.py",
+              "def test_z():\n    assert False, 'flaky'\n")
+
+
+FLAKY_FROM_THE_ROOT = ["pkg_a.test_only_a::test_z",
+                       "pkg_a.test_util.TestK::test_y",
+                       "pkg_a.test_util::test_p[1.5]",
+                       "pkg_a.test_util::test_x"]
+
+
+@unittest.skipUnless(HAVE_PYTEST, "pytest not installed")
+class TestPluginWithRealPytest(unittest.TestCase):
+    """The panel's scenario with real pytest and the ids pytest really
+    writes: only the flaky package is skipped."""
+
+    def test_only_the_flaky_package_is_skipped(self):
+        tmp = mktemp()
+        make_two_package_project(tmp)
+        first = pytest_outcomes(tmp, [], targets=("pkg_a", "pkg_b"), ok=(1,))
+        flaky = sorted(i for i, o in first.items() if o == "failed")
+        self.assertEqual(flaky, FLAKY_FROM_THE_ROOT)   # what flakebox records
+        quar_mod.write_pytest(tmp, flaky)
+        second = pytest_outcomes(tmp, ["-p", "flakebox_quarantine"],
+                                 targets=("pkg_a", "pkg_b"))
+        self.assertEqual(second, {
+            "pkg_a.test_only_a::test_z": "skipped",
+            "pkg_a.test_util.TestK::test_y": "skipped",
+            "pkg_a.test_util::test_p[1.5]": "skipped",
+            "pkg_a.test_util::test_p[2.0]": "passed",
+            "pkg_a.test_util::test_x": "skipped",
+            "pkg_b.test_util.TestK::test_y": "passed",
+            "pkg_b.test_util::test_p[1.5]": "passed",
+            "pkg_b.test_util::test_p[2.0]": "passed",
+            "pkg_b.test_util::test_x": "passed"})
+
+    def test_ids_recorded_at_the_root_match_a_run_rooted_inside_the_package(self):
+        tmp = mktemp()
+        make_two_package_project(tmp)
+        quar_mod.write_pytest(tmp, FLAKY_FROM_THE_ROOT)
+        outcomes = pytest_outcomes(
+            tmp, ["-p", "flakebox_quarantine", "--rootdir", "pkg_a"],
+            targets=("pkg_a",))
+        self.assertEqual(outcomes, {
+            "test_only_a::test_z": "skipped",
+            "test_util.TestK::test_y": "skipped",
+            "test_util::test_p[1.5]": "skipped",
+            "test_util::test_p[2.0]": "passed",
+            "test_util::test_x": "skipped"})
+
+    def test_ids_recorded_inside_the_package_match_a_run_rooted_at_the_root(self):
+        tmp = mktemp()
+        make_two_package_project(tmp)
+        quar_mod.write_pytest(tmp, ["test_only_a::test_z"])
+        outcomes = pytest_outcomes(
+            tmp, ["-p", "flakebox_quarantine"], targets=("pkg_a", "pkg_b"),
+            ok=(1,))
+        self.assertEqual(outcomes["pkg_a.test_only_a::test_z"], "skipped")
+        # the other flaky tests were not named, so they still run (and fail)
+        self.assertEqual(outcomes["pkg_a.test_util::test_x"], "failed")
+        self.assertEqual(outcomes["pkg_b.test_util::test_x"], "passed")
+
+    def test_deselect_is_a_prefix_match_and_the_plugin_is_not(self):
+        """Why the README calls `--format deselect` best effort: pytest's
+        --deselect drops every id that STARTS with the one given."""
+        tmp = mktemp()
+        tdir = os.path.join(tmp, "tests")
+        os.makedirs(tdir)
+        write_raw(tdir, "test_p.py",
+                  "def test_x():\n    pass\n\n\ndef test_xy():\n    pass\n")
+        flaky = ["tests.test_p::test_x"]
+        self.assertEqual(
+            pytest_outcomes(tmp, quar_mod.deselect_args(flaky)), {})
+        quar_mod.write_pytest(tmp, flaky)
+        self.assertEqual(
+            pytest_outcomes(tmp, ["-p", "flakebox_quarantine"]),
+            {"tests.test_p::test_x": "skipped",
+             "tests.test_p::test_xy": "passed"})
+
+
+# ---------------------------------------------------------------------------
+# Round 7: the command flakebox prints must work as printed
+# ---------------------------------------------------------------------------
+
+
+def run_flakebox(cwd: str, *argv) -> subprocess.CompletedProcess:
+    """`python -m flakebox ...` from this checkout, run in `cwd`."""
+    env = child_env()
+    env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
+    return subprocess.run([sys.executable, "-m", "flakebox", *argv], cwd=cwd,
+                          capture_output=True, text=True, timeout=120, env=env)
+
+
+def printed_pytest_command(stdout: str) -> str:
+    [line] = [ln for ln in stdout.splitlines()
+              if ln.startswith("run pytest with: ")]
+    return line[len("run pytest with: "):]
+
+
+def make_demo_project(tmp: str) -> str:
+    """tests/test_demo.py with one flaky test (it fails here) and one healthy
+    test, and a history database that names the flaky one. Returns the DB."""
+    tdir = os.path.join(tmp, "tests")
+    os.makedirs(tdir)
+    write_raw(tdir, "test_demo.py",
+              "def test_flaky():\n    assert False, 'flaky'\n\n\n"
+              "def test_ok():\n    pass\n")
+    return db_from_outcomes(tmp, {
+        "tests.test_demo::test_flaky": ["failed", "passed"] * 3,
+        "tests.test_demo::test_ok": ["passed"] * 6})
+
+
+DEMO_OUTCOMES = {"tests.test_demo::test_flaky": "skipped",
+                 "tests.test_demo::test_ok": "passed"}
+
+
+def bare_pytest_argvs() -> list:
+    """The ways to start pytest the way the `pytest` command does: through a
+    console script, so the script's directory - not the current directory -
+    is first on sys.path. The real entry point next to this interpreter when
+    there is one, and always a launcher with the same body, which works
+    wherever pytest can be imported."""
+    argvs = []
+    scripts = os.path.dirname(os.path.abspath(sys.executable))
+    for name in ("pytest", "pytest.exe"):
+        exe = os.path.join(scripts, name)
+        if os.path.isfile(exe):
+            argvs.append([exe])
+    here = mktemp()          # not the project: the launcher's directory only
+    write_raw(here, "pytest_launcher.py",
+              "import sys\nimport pytest\n"
+              "sys.exit(getattr(pytest, 'console_main', pytest.main)())\n")
+    argvs.append([sys.executable, os.path.join(here, "pytest_launcher.py")])
+    return argvs
+
+
+def pytest_argvs(printed: str) -> list:
+    """What to run for the command flakebox printed: `python` is this
+    interpreter, and `pytest` is every bare entry point."""
+    words = shlex.split(printed)
+    if words[:3] == ["python", "-m", "pytest"]:
+        return [[sys.executable, "-m", "pytest"] + words[3:]]
+    if words[0] == "pytest":
+        return [argv + words[1:] for argv in bare_pytest_argvs()]
+    raise AssertionError(f"not a pytest command: {printed!r}")
+
+
+def run_pytest_argv(cwd: str, argv: list,
+                    pythonpath: str = "") -> subprocess.CompletedProcess:
+    """Run `argv` on cwd/tests with PYTHONPATH exactly `pythonpath` (unset
+    when empty), so only the command itself can make the plugin importable."""
+    env = child_env(PYTHONDONTWRITEBYTECODE="1")
+    env.pop("PYTHONPATH", None)
+    if pythonpath:
+        env["PYTHONPATH"] = pythonpath
+    return subprocess.run(
+        argv + ["-q", "-p", "no:cacheprovider", "--junitxml",
+                os.path.join(cwd, "j.xml"), "tests"],
+        cwd=cwd, capture_output=True, text=True, timeout=120, env=env)
+
+
+class TestPrintedPytestCommand(unittest.TestCase):
+    """R7 flakebox #1: the next step flakebox printed (and the README showed),
+    `pytest -p flakebox_quarantine`, fails under the `pytest` command with
+    ImportError: `-p` imports the plugin at start-up and only `python -m
+    pytest` puts the current directory, where `-o .` wrote it, on sys.path."""
+
+    def quarantine(self, tmp: str, db: str, out: str):
+        proc = run_flakebox(tmp, "--db", db, "quarantine", "--format",
+                            "pytest", "-o", out)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc
+
+    def test_the_command_names_the_module_form(self):
+        tmp = mktemp()
+        db = make_demo_project(tmp)
+        proc = self.quarantine(tmp, db, ".")
+        self.assertEqual(printed_pytest_command(proc.stdout),
+                         "python -m pytest -p flakebox_quarantine")
+        self.assertNotIn("PYTHONPATH", proc.stdout)   # it is in the cwd
+
+    def test_a_plugin_written_elsewhere_is_said_to_need_pythonpath(self):
+        tmp = mktemp()
+        db = make_demo_project(tmp)
+        plugin_dir = os.path.join(mktemp(), "ci-plugin")
+        proc = self.quarantine(tmp, db, plugin_dir)
+        [note] = [ln for ln in proc.stdout.splitlines() if "PYTHONPATH" in ln]
+        self.assertIn(plugin_dir, note)
+        # a spelling of the same directory that is the cwd is not "elsewhere"
+        for here in (".", "./", tmp, os.path.join(tmp, "tests", "..")):
+            self.assertNotIn("PYTHONPATH", self.quarantine(tmp, db, here).stdout)
+
+    @unittest.skipUnless(HAVE_PYTEST, "pytest not installed")
+    def test_the_printed_command_works_as_printed(self):
+        tmp = mktemp()
+        db = make_demo_project(tmp)
+        printed = printed_pytest_command(self.quarantine(tmp, db, ".").stdout)
+        for argv in pytest_argvs(printed):
+            proc = run_pytest_argv(tmp, argv)
+            self.assertEqual(proc.returncode, 0,
+                             f"{argv}\n{proc.stdout}\n{proc.stderr}")
+            self.assertEqual(
+                {r["test_id"]: r["outcome"]
+                 for r in junit_mod.parse(os.path.join(tmp, "j.xml"))},
+                DEMO_OUTCOMES)
+
+    @unittest.skipUnless(HAVE_PYTEST, "pytest not installed")
+    def test_a_plugin_written_elsewhere_works_with_pythonpath_on_either_command(self):
+        tmp = mktemp()
+        db = make_demo_project(tmp)
+        plugin_dir = os.path.join(mktemp(), "ci-plugin")
+        self.quarantine(tmp, db, plugin_dir)
+        for argv in ([[sys.executable, "-m", "pytest"]] + bare_pytest_argvs()):
+            proc = run_pytest_argv(tmp, argv + ["-p", "flakebox_quarantine"],
+                                   pythonpath=plugin_dir)
+            self.assertEqual(proc.returncode, 0,
+                             f"{argv}\n{proc.stdout}\n{proc.stderr}")
+            self.assertEqual(
+                {r["test_id"]: r["outcome"]
+                 for r in junit_mod.parse(os.path.join(tmp, "j.xml"))},
+                DEMO_OUTCOMES)
+
+    @unittest.skipUnless(HAVE_PYTEST, "pytest not installed")
+    def test_the_bare_command_cannot_import_the_plugin(self):
+        """What the README warns about, so it stays true: if a newer pytest
+        starts importing -p plugins from the current directory, this fails
+        and the warning (and the printed command) can be simplified."""
+        tmp = mktemp()
+        db = make_demo_project(tmp)
+        self.quarantine(tmp, db, ".")
+        for argv in bare_pytest_argvs():
+            proc = run_pytest_argv(tmp, argv + ["-p", "flakebox_quarantine"])
+            self.assertNotEqual(proc.returncode, 0, argv)
+            self.assertIn("flakebox_quarantine", proc.stdout + proc.stderr)
+            self.assertIn("ImportError", proc.stdout + proc.stderr)
+
+    def test_no_documentation_shows_the_bare_command(self):
+        bare = re.compile(r"(?<!-m )pytest -p flakebox_quarantine")
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        with open(os.path.join(REPO, "flakebox", "cli.py"),
+                  encoding="utf-8") as f:
+            cli_source = f.read()
+        self.assertEqual(bare.findall(readme), [])
+        self.assertEqual(bare.findall(cli_source), [])
+        self.assertEqual(bare.findall(quar_mod.PYTEST_PLUGIN), [])
+        self.assertIn("python -m pytest -p flakebox_quarantine",
+                      quar_mod.PYTEST_PLUGIN)
+        self.assertGreaterEqual(
+            readme.count("python -m pytest -p flakebox_quarantine"), 2)
+        flat = " ".join(readme.split())
+        for needle in ("not as the bare `pytest` command",
+                       "only `python -m pytest` puts the current directory",
+                       "put that directory on `PYTHONPATH`"):
+            self.assertIn(needle, flat)
 
 
 class TestDeselectQuoting(unittest.TestCase):
@@ -3284,6 +3844,270 @@ class TestBrokenPipe(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, err)
         self.assertNotIn(b"Traceback", err)
         self.assertNotIn(b"Exception ignored", err)
+
+
+class TestArgumentsThatCannotBeUsed(unittest.TestCase):
+    """R7 flakebox #3: an `-o` that is a file, an integer too big for SQLite
+    and a byte in argv that is not UTF-8 each ended in a traceback (exit 1)
+    instead of a one-line `error:` and exit 2."""
+
+    BIG = "99999999999999999999"
+    INT64_MIN, INT64_MAX = -2 ** 63, 2 ** 63 - 1
+
+    def refused(self, *argv) -> str:
+        """Run main(argv) expecting argparse to refuse it: exit 2, the
+        reason on stderr, no traceback."""
+        err = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                cli_mod.main(list(argv))
+        self.assertEqual(cm.exception.code, 2, argv)
+        self.assertIn("error:", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        return err.getvalue()
+
+    def test_an_output_directory_that_cannot_be_made_is_a_one_line_error(self):
+        tmp = mktemp()
+        db = make_db(tmp)
+        a_file = write_raw(tmp, "README.md", "not a directory\n")
+        a_json_dir = os.path.join(tmp, "plugin")
+        os.makedirs(os.path.join(a_json_dir, "flakebox_quarantine.json"))
+        for out in (a_file, os.path.join(a_file, "sub"), a_json_dir):
+            code, stdout, err = run_cli("--db", db, "quarantine", "--format",
+                                        "pytest", "-o", out)
+            self.assertEqual(code, 2, (out, err))
+            self.assertTrue(err.startswith(
+                f"error: cannot write the pytest plugin to {out}: "), err)
+            self.assertEqual(err.count("\n"), 1, err)
+            self.assertEqual(stdout, "")
+        with open(a_file, encoding="utf-8") as f:    # nothing replaced it
+            self.assertEqual(f.read(), "not a directory\n")
+
+    def test_integers_outside_what_sqlite_stores_are_refused(self):
+        db = make_db(mktemp())
+        for argv in (["report", "--retire-after", self.BIG],
+                     ["quarantine", "--format", "json", "--retire-after", self.BIG],
+                     ["history", "--test", "x::y", "--retire-after", self.BIG],
+                     ["history", "--test", "x::y", "--limit", self.BIG],
+                     ["history", "--test", "x::y", "--limit", "-" + self.BIG],
+                     ["report", "--retire-after", str(self.INT64_MAX + 1)],
+                     ["history", "--test", "x::y", "--limit", str(self.INT64_MIN - 1)]):
+            text = self.refused("--db", db, *argv)
+            self.assertIn(str(self.INT64_MIN), text, argv)   # names the range
+            self.assertIn(str(self.INT64_MAX), text, argv)
+
+    def test_the_edges_of_that_range_and_the_documented_values_still_work(self):
+        db = make_db(mktemp())
+        for value in (str(self.INT64_MAX), str(self.INT64_MIN), "0", "-1", "3"):
+            code, _, err = run_cli("--db", db, "report", "--retire-after", value)
+            self.assertEqual((code, err), (0, ""), value)
+            code, _, err = run_cli("--db", db, "history", "--test",
+                                   "tests.test_a.TestA::test_flaky",
+                                   "--limit", value)
+            self.assertEqual((code, err), (0, ""), value)
+        # integers that never reach the database keep any size
+        code, _, err = run_cli("--db", db, "report", "--min-runs", self.BIG,
+                               "--stable-runs", self.BIG)
+        self.assertEqual((code, err), (0, ""))
+
+    def test_a_non_integer_is_still_the_argparse_message(self):
+        db = make_db(mktemp())
+        for flag in ("--retire-after", "--limit"):
+            argv = ["history", "--test", "x::y", flag, "abc"]
+            self.assertIn("argument %s: invalid int value: 'abc'" % flag,
+                          self.refused("--db", db, *argv))
+
+    def test_text_that_is_not_utf8_is_refused_before_it_reaches_the_database(self):
+        # what Python makes of a byte in argv that is not UTF-8
+        stray = b"c\xff".decode("utf-8", "surrogateescape")
+        db = make_db(mktemp())
+        junit = write_junit(mktemp(), True)
+        for argv in (["record", "--junit", junit, "--commit", stray],
+                     ["record", "--junit", junit, "--branch", stray],
+                     ["unquarantine", "--test", stray],
+                     ["history", "--test", stray]):
+            text = self.refused("--db", db, *argv)
+            self.assertIn("UTF-8", text, argv)
+        # nothing was recorded, and text that is valid is still fine
+        conn = store_mod.connect(db)
+        n_runs = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+        conn.close()
+        accented = "caf" + chr(0xe9)
+        code, out, err = run_cli("--db", db, "record", "--junit", junit,
+                                 "--commit", accented, "--branch", accented)
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("recorded run %d" % (n_runs + 1), out)
+
+    @unittest.skipIf(os.name == "nt",
+                     "a Windows command line is UTF-16: it cannot hold a stray byte")
+    def test_a_real_command_line_with_a_stray_byte_and_a_huge_number(self):
+        tmp = mktemp()
+        db = make_db(tmp)
+        for argv in ([b"history", b"--test", b"a::t\xff"],
+                     [b"unquarantine", b"--test", b"a::t\xff"],
+                     [b"history", b"--test", b"a::t", b"--limit", self.BIG.encode()],
+                     [b"report", b"--retire-after", self.BIG.encode()]):
+            env = child_env()
+            env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
+            proc = subprocess.run(
+                [sys.executable, "-m", "flakebox", "--db", db] + argv,
+                cwd=tmp, capture_output=True, timeout=120, env=env)
+            err = proc.stderr.decode("utf-8", "replace")
+            self.assertEqual(proc.returncode, 2, (argv, err))
+            self.assertIn("error:", err)
+            self.assertNotIn("Traceback", err)
+
+    def test_the_readme_says_these_are_exit_2(self):
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            flat = " ".join(f.read().split())
+        for needle in ("an `-o` that is a file or cannot be created",
+                       "outside the 64-bit range SQLite stores",
+                       "-9223372036854775808 to 9223372036854775807",
+                       "is not valid UTF-8 text"):
+            self.assertTrue(needle in flat, f"the README lacks {needle!r}")
+
+
+def setuptools_major() -> int:
+    """The installed setuptools' major version, 0 when there is none (it is
+    not imported: importing it patches distutils for the whole process)."""
+    try:
+        from importlib import metadata
+        return int(metadata.version("setuptools").split(".")[0])
+    except Exception:
+        return 0
+
+
+class TestSdistCarriesWhatTheTestsRead(unittest.TestCase):
+    """R7 flakebox #4: the sdist shipped tests/ but not action.yml, so the
+    sdist's own suite had 14 errors."""
+
+    # setuptools puts these into every sdist by itself
+    AUTOMATIC = {"pyproject.toml", "README.md", "LICENSE", "MANIFEST.in"}
+    DIRECTORIES = {"flakebox", "tests"}
+
+    def manifest_includes(self) -> set:
+        with open(os.path.join(REPO, "MANIFEST.in"), encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f
+                     if ln.strip() and not ln.lstrip().startswith("#")]
+        return {ln.split(None, 1)[1] for ln in lines if ln.startswith("include ")}
+
+    def test_the_manifest_names_the_action_and_only_files_that_exist(self):
+        included = self.manifest_includes()
+        self.assertIn("action.yml", included)
+        for name in included:
+            self.assertTrue(os.path.exists(os.path.join(REPO, name)), name)
+
+    def test_every_top_level_file_the_tests_read_is_shipped(self):
+        read = {"action.yml"}                          # action_text()
+        for fn in ("test_flakebox.py", "test_harden_streams.py",
+                   "test_windows_pipe.py"):
+            with open(os.path.join(REPO, "tests", fn), encoding="utf-8") as f:
+                read |= set(re.findall(r'os\.path\.join\(REPO,\s*"([^"]+)"',
+                                       f.read()))
+        shipped = self.AUTOMATIC | self.DIRECTORIES | self.manifest_includes()
+        self.assertEqual(sorted(read - shipped), [])
+
+    @unittest.skipIf(setuptools_major() < 77,
+                     "building the sdist needs setuptools >= 77 "
+                     "(pyproject's build backend)")
+    def test_a_built_sdist_carries_them(self):
+        src = mktemp()    # a copy: the build writes flakebox.egg-info beside it
+        for name in ("pyproject.toml", "README.md", "LICENSE", "MANIFEST.in",
+                     "action.yml"):
+            shutil.copy2(os.path.join(REPO, name), src)
+        for d in ("flakebox", "tests"):
+            shutil.copytree(os.path.join(REPO, d), os.path.join(src, d),
+                            ignore=shutil.ignore_patterns("__pycache__"))
+        out = mktemp()
+        proc = subprocess.run(
+            [sys.executable, "-c", "import sys\nfrom setuptools import "
+             "build_meta\nprint(build_meta.build_sdist(sys.argv[1]))", out],
+            cwd=src, capture_output=True, text=True, timeout=300,
+            env=child_env(PYTHONDONTWRITEBYTECODE="1"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        tarball = os.path.join(out, proc.stdout.strip().splitlines()[-1])
+        with tarfile.open(tarball) as tf:
+            names = {n.split("/", 1)[1] for n in tf.getnames() if "/" in n}
+        for needed in ("action.yml", "README.md", "LICENSE", "pyproject.toml",
+                       "flakebox/cli.py", "tests/test_flakebox.py"):
+            self.assertIn(needed, names)
+
+
+class TestActionReference(unittest.TestCase):
+    """R7 flakebox #5: the README example said `uses: your-org/flakebox@v1`,
+    a placeholder owner and a tag that did not exist."""
+
+    def test_the_example_names_the_real_owner_and_does_not_promise_a_tag(self):
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        self.assertNotIn("your-org", readme)
+        [owner] = set(re.findall(r"github\.com/([\w-]+)/flakebox", readme))
+        refs = re.findall(r"uses: ([\w-]+)/flakebox@(\S+)", readme)
+        # GitHub's default branch is `main` (the local working branch name is
+        # not what the Action reference resolves against)
+        self.assertEqual(refs, [(owner, "main")])
+        flat = " ".join(readme.split())
+        for needle in ("A `@v1` reference works only once a release is tagged "
+                       "`v1`", "or pin a commit SHA"):
+            self.assertTrue(needle in flat, f"the README lacks {needle!r}")
+
+
+class TestDeselectLineEnding(unittest.TestCase):
+    """R7 flakebox #8 (unverified on Windows): text-mode stdout writes "\n"
+    as "\r\n" there, Git-Bash's `$(...)` strips only the "\n", and the last
+    id of `eval "pytest $(flakebox quarantine --format deselect)"` ended in
+    a carriage return and matched nothing. Simulated here with a text stream
+    that translates the way a Windows console does."""
+
+    IDS = ["tests.test_c::test_param[a b]", "tests.test_c::test_plain",
+           "tests.test_c::test_param[line\nbreak]"]
+
+    def windows_stdout(self):
+        raw = io.BytesIO()
+        return raw, io.TextIOWrapper(raw, encoding="utf-8", newline="\r\n",
+                                     write_through=True)
+
+    def test_the_simulated_stream_really_writes_crlf(self):
+        raw, stream = self.windows_stdout()
+        stream.write("a\nb\n")
+        self.assertEqual(raw.getvalue(), b"a\r\nb\r\n")
+
+    def test_the_deselect_line_ends_in_lf_and_holds_no_carriage_return(self):
+        tmp = mktemp()
+        db = os.path.join(tmp, "q.db")
+        conn = store_mod.connect(db)
+        for tid in self.IDS:
+            store_mod.quarantine_add(conn, tid)
+        conn.close()
+        raw, stream = self.windows_stdout()
+        with redirect_stdout(stream), redirect_stderr(io.StringIO()):
+            code = cli_mod.main(["--db", db, "quarantine", "--format", "deselect"])
+        stream.flush()
+        self.assertEqual(code, 0)
+        data = raw.getvalue()
+        self.assertTrue(data.endswith(b"\n"))
+        self.assertNotIn(b"\r", data)
+        if os.name != "nt":      # the id with a newline in it comes back whole
+            self.assertEqual(shlex.split(data.decode("utf-8")),
+                             quar_mod.deselect_args(self.IDS))
+
+    def test_the_other_formats_are_left_to_the_platform(self):
+        tmp = mktemp()
+        db = make_db(tmp)
+        raw, stream = self.windows_stdout()
+        with redirect_stdout(stream):
+            self.assertEqual(cli_mod.main(["--db", db, "quarantine",
+                                           "--format", "json"]), 0)
+        stream.flush()
+        self.assertIn(b"\r\n", raw.getvalue())
+
+    def test_the_readme_says_what_was_and_was_not_tested(self):
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            flat = " ".join(f.read().split())
+        for needle in ("plain LF ending, not CR LF",
+                       "keeps (the id then matches nothing)",
+                       "has not been run on Windows"):
+            self.assertTrue(needle in flat, f"the README lacks {needle!r}")
 
 
 if __name__ == "__main__":

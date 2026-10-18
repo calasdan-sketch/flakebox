@@ -28,7 +28,7 @@ from . import junit as junit_mod
 from . import quarantine as quar_mod
 from . import store as store_mod
 
-VERSION = "0.4.3"
+VERSION = "0.4.4"
 
 
 def default_db() -> str:
@@ -56,6 +56,58 @@ def _harden_streams() -> None:
 
 def _db(path: str | None):
     return store_mod.connect(path or default_db())
+
+
+def _short(text: str) -> str:
+    return text if len(text) <= 30 else text[:27] + "..."
+
+
+def _int64(text: str) -> int:
+    """argparse `type` for an integer that reaches the database. SQLite
+    stores 64 bits; binding a bigger Python int is an OverflowError, which
+    used to end in a traceback."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid int value: {_short(text)!r}") from None
+    low, high = -store_mod._INT64, store_mod._INT64 - 1
+    if not low <= value <= high:
+        raise argparse.ArgumentTypeError(
+            f"{_short(text)} is out of range (allowed: {low} to {high})")
+    return value
+
+
+def _utf8(text: str) -> str:
+    """argparse `type` for text that is stored in the database. A byte of
+    argv that is not UTF-8 reaches Python as a lone surrogate, which SQLite
+    cannot store (a UnicodeEncodeError, and a traceback)."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise argparse.ArgumentTypeError(
+            "must be valid UTF-8 text (it is stored in the database)") from None
+    return text
+
+
+def _lf_only(stream) -> None:
+    """Write "\\n" as "\\n" on `stream`. Text-mode stdout turns it into
+    "\\r\\n" on Windows, and Git-Bash's `$(...)` strips only the "\\n", so
+    the last word of the deselect line kept a carriage return."""
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is not None:
+        try:
+            reconfigure(newline="\n")
+        except (OSError, ValueError):
+            pass
+
+
+def _is_cwd(path: str) -> bool:
+    """Is `path` the current directory (however it is spelled)?"""
+    try:
+        return os.path.samefile(path, os.getcwd())
+    except OSError:
+        return False
 
 
 def cmd_record(args) -> int:
@@ -165,16 +217,27 @@ def cmd_quarantine(args) -> int:
                f"{len(full)} in quarantine.")
     if args.format == "pytest":
         out_dir = args.out or "."
-        written = quar_mod.write_pytest(out_dir, full, mode=args.mode)
+        try:
+            written = quar_mod.write_pytest(out_dir, full, mode=args.mode)
+        except OSError as e:    # -o is a file, no permission, no such drive
+            print(f"error: cannot write the pytest plugin to {out_dir}: "
+                  f"{e.strerror or e}", file=sys.stderr)
+            return 2
         print(summary)
         for w in written:
             print(f"  wrote {w}")
-        print("run pytest with: pytest -p flakebox_quarantine")
+        # `-p` imports the plugin at start-up. `python -m pytest` puts the
+        # current directory on sys.path, the bare `pytest` command does not.
+        print("run pytest with: python -m pytest -p flakebox_quarantine")
+        if not _is_cwd(out_dir):
+            print(f"  ({out_dir} is not the current directory: put it on "
+                  f"PYTHONPATH first, or python cannot import the plugin)")
     elif args.format == "deselect":
         # stdout is meant for `eval "pytest $(flakebox quarantine --format
         # deselect)"`: only the (shell-quoted) args go there, the summary
         # goes to stderr
         print(summary, file=sys.stderr)
+        _lf_only(sys.stdout)    # no CR at the end of what `$(...)` captures
         print(quar_mod.deselect_line(full))
     else:
         print(json.dumps({"quarantined": full, "new": new}, indent=2))
@@ -291,7 +354,7 @@ def build_parser() -> argparse.ArgumentParser:
                         default=detect_mod.STABLE_RUNS,
                         help="consecutive passes that make a test stable "
                              f"(default {detect_mod.STABLE_RUNS})")
-    detect.add_argument("--retire-after", type=int,
+    detect.add_argument("--retire-after", type=_int64,
                         default=detect_mod.RETIRE_AFTER, metavar="N",
                         help="a test absent from the newest N runs is "
                              "retired (deleted/renamed): listed apart, "
@@ -302,8 +365,8 @@ def build_parser() -> argparse.ArgumentParser:
     r = sub.add_parser("record", parents=[common],
                        help="Ingest a JUnit XML report.")
     r.add_argument("--junit", required=True)
-    r.add_argument("--commit", default=None)
-    r.add_argument("--branch", default=None)
+    r.add_argument("--commit", type=_utf8, default=None)
+    r.add_argument("--branch", type=_utf8, default=None)
     r.add_argument("--force", action="store_true",
                    help="record even if this exact report (same commit, "
                         "same bytes) was recorded before")
@@ -330,13 +393,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "xfail so they keep recording results")
 
     u = sub.add_parser("unquarantine", parents=[common], help="Release a test.")
-    u.add_argument("--test", required=True)
+    u.add_argument("--test", required=True, type=_utf8)
 
     h = sub.add_parser("history", parents=[common, detect],
                        help="Per-test run history (same thresholds as "
                             "report, so the status word agrees).")
-    h.add_argument("--test", required=True)
-    h.add_argument("--limit", type=int, default=50)
+    h.add_argument("--test", required=True, type=_utf8)
+    h.add_argument("--limit", type=_int64, default=50)
 
     e = sub.add_parser("export", parents=[common],
                        help="Write the whole DB (runs, results, quarantine) "

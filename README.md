@@ -28,7 +28,7 @@ flakebox report --format json
 
 # quarantine the flaky set for pytest:
 flakebox quarantine --format pytest -o .
-pytest -p flakebox_quarantine        # flakes are skipped, build stays green
+python -m pytest -p flakebox_quarantine   # flakes are skipped, build stays green
 
 # ...or keep running the flakes without letting them fail the build, so
 # they keep recording results and can earn their way back out:
@@ -54,6 +54,13 @@ subcommand: `flakebox --db ci.db report` and `flakebox report --db ci.db`
 are the same command. Default `~/.flakebox/history.db`
 (`%USERPROFILE%\.flakebox\history.db` on Windows). A `--db` that is not a
 SQLite database is a clean `error: cannot use database ...`, exit 2.
+So are the other arguments flakebox cannot use: each ends in an `error:`
+line and exit 2, never a traceback. That covers an `-o` that is a file or
+cannot be created, an integer option that reaches the database
+(`--retire-after`, `history --limit`) outside the 64-bit range SQLite
+stores (-9223372036854775808 to 9223372036854775807), and a `--commit`,
+`--branch` or `--test` that is not valid UTF-8 text (a stray byte in the
+command line).
 
 `flakebox record` hashes the report: recording the same file for the
 same commit twice says `already recorded as run N` and adds nothing
@@ -84,14 +91,26 @@ newly added tests. The one-line summary (`quarantined 1 new test(s); 3
 in quarantine.`) goes to stderr for `--format deselect`, so stdout is
 only ever the `--deselect` arguments.
 
+Run the plugin with `python -m pytest -p flakebox_quarantine`, not as the
+bare `pytest` command: `-p` imports `flakebox_quarantine` at start-up, and
+only `python -m pytest` puts the current directory (where `-o .` wrote the
+plugin) on `sys.path`. The bare command fails with an `ImportError` (`No
+module named 'flakebox_quarantine'`). If `-o` wrote the plugin to another
+directory, put that directory on `PYTHONPATH` first
+(`PYTHONPATH=ci python -m pytest -p flakebox_quarantine`; `set
+PYTHONPATH=ci` in `cmd.exe`, `$env:PYTHONPATH = "ci"` in PowerShell); with
+it set, the bare `pytest` command works too.
+
 `--format deselect` is **best effort**: JUnit ids are not pytest node
 ids, so flakebox maps the common pytest shapes
 (`pkg.module.Class::test_x` → `pkg/module.py::Class::test_x`,
 `pkg.module::test_x` → `pkg/module.py::test_x`) and pytest ignores a
 `--deselect` that matches nothing. A lowercase class name, a
 `python_files` pattern other than `*.py`, or a non-pytest producer breaks
-the guess; the generated plugin (`--format pytest`) suffix-matches node
-ids instead and is the reliable path. The line quotes each argument for
+the guess, and pytest's `--deselect` is a *prefix* match (`--deselect
+t.py::test_x` also drops `test_xy` and `test_x[1]`); the generated plugin
+(`--format pytest`) matches whole names and path components instead (see
+below) and is the reliable path. The line quotes each argument for
 the shell (POSIX quoting; `cmd.exe` quoting on Windows), so the shell
 has to parse it once more: `eval "pytest $(flakebox quarantine --format
 deselect)"` hands pytest every id as one argument, even
@@ -107,9 +126,24 @@ leaves `;`, `&`, `,`, `$`, backticks and parentheses bare, and PowerShell
 may parse those itself (an id that contains one may be split, or even
 run). If an id can contain one, use the plugin.
 
-Parametrised ids are matched whole by the plugin: quarantining
-`test_version[1.5]` skips exactly that case, never `test_unrelated[0.5]`
-or `test_version[2.0]`.
+On Windows the `--format deselect` line is written with a plain LF ending,
+not CR LF: text-mode output would end the last id with a carriage return,
+which Git-Bash's `$(...)` keeps (the id then matches nothing). That is
+simulated in the tests with a text stream that writes CR LF; it has not
+been run on Windows.
+
+The plugin matches a test to a quarantined id by name and by whole path
+components, in either spelling (`tests/test_mod.py::TestA::test_x` and
+`tests.test_mod.TestA::test_x` are the same test): the names, with any
+`[parameters]`, must be equal, and so must the module path and class
+names, except that one side may lack leading directories, because CI and
+your machine can have different rootdirs. So `test_mod.py::test_x` is the
+quarantined `tests.test_mod::test_x`, but `pkg_a/test_util.py::test_x` is
+never `pkg_b/test_util.py::test_x`. When the *recorded* id is the shorter
+one, it cannot say which directory it came from and every test that ends
+the same way matches: record and test from the same rootdir. Parametrised
+ids are matched whole: quarantining `test_version[1.5]` skips exactly that
+case, never `test_unrelated[0.5]` or `test_version[2.0]`.
 
 Example report:
 
@@ -168,7 +202,9 @@ executed runs. History lives in SQLite (`--db` to override).
 
 ### Quarantine modes
 
-The generated pytest plugin reads `flakebox_quarantine.json`:
+The generated pytest plugin reads `flakebox_quarantine.json` (the sorted
+ids, the mode and a count; no timestamp, so regenerating an unchanged set
+rewrites identical files and `git` shows no diff):
 
 - `--mode skip` (default): quarantined tests are skipped. They record no
   result, so they cannot become *stable* on their own — run them
@@ -211,7 +247,7 @@ optionally — quarantines the flaky set and exports the history as
 artifact-ready files.
 
 ```yaml
-- uses: your-org/flakebox@v1
+- uses: calasdan-sketch/flakebox@main
   with:
     junit: reports/junit.xml
     min-runs: "5"          # -> flakebox report --min-runs 5
@@ -223,6 +259,9 @@ artifact-ready files.
     name: flakebox
     path: flakebox/
 ```
+
+`@main` is this repository's default branch. A `@v1` reference works only once a
+release is tagged `v1`; until then use the branch, or pin a commit SHA.
 
 | input               | default    | what it does                                  |
 |---------------------|------------|-----------------------------------------------|
@@ -248,10 +287,10 @@ flakebox quarantine --format pytest -o .      # flakebox_quarantine.{py,json}
 git add flakebox_quarantine.py flakebox_quarantine.json && git commit
 ```
 
-and run the suite with `pytest -p flakebox_quarantine` (skip mode) or
-`--mode xfail` so the quarantined tests keep reporting and can earn
-their way back out. When the report says a test is stable, `flakebox
-unquarantine --test ...` locally, regenerate the plugin, commit.
+and run the suite with `python -m pytest -p flakebox_quarantine` (skip
+mode) or `--mode xfail` so the quarantined tests keep reporting and can
+earn their way back out. When the report says a test is stable,
+`flakebox unquarantine --test ...` locally, regenerate the plugin, commit.
 
 Input names use dashes everywhere (`min-runs`, never `min_runs`); the test
 suite reads `action.yml` and checks that every referenced input is
