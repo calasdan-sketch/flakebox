@@ -28,7 +28,7 @@ from . import junit as junit_mod
 from . import quarantine as quar_mod
 from . import store as store_mod
 
-VERSION = "0.4.0"
+VERSION = "0.4.2"
 
 
 def default_db() -> str:
@@ -162,8 +162,8 @@ def cmd_quarantine(args) -> int:
             print(f"  wrote {w}")
         print("run pytest with: pytest -p flakebox_quarantine")
     elif args.format == "deselect":
-        # stdout is meant for `pytest $(flakebox quarantine --format
-        # deselect)`: only the (shell-quoted) args go there, the summary
+        # stdout is meant for `eval "pytest $(flakebox quarantine --format
+        # deselect)"`: only the (shell-quoted) args go there, the summary
         # goes to stderr
         print(summary, file=sys.stderr)
         print(quar_mod.deselect_line(full))
@@ -219,7 +219,12 @@ def cmd_history(args) -> int:
 def cmd_export(args) -> int:
     conn = _db(args.db)
     try:
-        data = store_mod.export_file(conn, args.out)
+        try:
+            data = store_mod.export_file(conn, args.out)
+        except OSError as e:    # a directory, no permission, no such folder
+            print(f"error: cannot export to {args.out}: {e.strerror or e}",
+                  file=sys.stderr)
+            return 2
     finally:
         conn.close()
     print(f"exported {len(data['runs'])} run(s), "
@@ -237,6 +242,10 @@ def cmd_import(args) -> int:
                 counts = store_mod.import_file(conn, path)
             except FileNotFoundError:
                 print(f"error: no such file: {path}", file=sys.stderr)
+                return 2
+            except OSError as e:    # a directory, no permission, ...
+                print(f"error: cannot import {path}: {e.strerror or e}",
+                      file=sys.stderr)
                 return 2
             except (ValueError, KeyError, TypeError) as e:
                 print(f"error: cannot import {path}: {e}", file=sys.stderr)

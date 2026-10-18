@@ -8,6 +8,8 @@ read-only or still-open files (Windows).
 """
 
 import argparse
+import ast
+import errno
 import importlib.util
 import io
 import json
@@ -23,6 +25,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 from flakebox import cli as cli_mod
 from flakebox import detect as detect_mod
@@ -81,6 +84,15 @@ def mktemp() -> str:
     d = tempfile.mkdtemp(prefix="fb")
     _tmp_dirs.append(d)
     return d
+
+
+def child_env(**extra) -> dict:
+    """The environment for a real subprocess: this process's (HOME and the
+    rest already point at the fake home) without PYTHONUNBUFFERED, plus
+    `extra`. A new dict every time."""
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONUNBUFFERED"}
+    env.update(extra)
+    return env
 
 
 # --------------------------------------------------------------------------
@@ -354,6 +366,120 @@ def action_text() -> str:
         return f.read()
 
 
+def action_steps(text: str) -> list:
+    """The steps of action.yml as [{"name", "uses", "env", "run"}].
+
+    Not a YAML parser, just enough for this file: a step is a `- ` item
+    under `steps:`; `env:` is a mapping of NAME: value lines; `run:` is a
+    scalar - the rest of its line plus every following line that is blank
+    or indented deeper than the key. That covers `|` and `>` blocks (their
+    common indent removed, `>` lines folded with spaces) and plain
+    multi-line scalars. `run` is None for a step without one."""
+    def indent(line: str) -> int:
+        return len(line) - len(line.lstrip(" "))
+
+    def deeper(line: str, ki: int) -> bool:
+        return not line.strip() or indent(line) > ki
+
+    def unquote(s: str) -> str:  # a scalar wrapped whole in one kind of quote
+        s = s.strip()
+        return s[1:-1] if len(s) > 1 and s[0] == s[-1] and s[0] in "\"'" else s
+
+    lines = text.splitlines()
+    top = next(i for i, ln in enumerate(lines) if ln.strip() == "steps:")
+    body = []
+    for ln in lines[top + 1:]:
+        if ln.strip() and not ln.lstrip().startswith("#") \
+                and indent(ln) <= indent(lines[top]):
+            break  # left the steps list
+        body.append(ln)
+    item = min(indent(ln) for ln in body if ln.lstrip().startswith("- "))
+    chunks: list = []
+    for ln in body:
+        if indent(ln) == item and ln.lstrip().startswith("- "):
+            chunks.append([" " * item + "  " + ln.lstrip()[2:]])
+        elif chunks:
+            chunks[-1].append(ln)
+    steps = []
+    for chunk in chunks:
+        ki = indent(chunk[0])
+        step: dict = {"name": None, "uses": None, "env": {}, "run": None}
+        j = 0
+        while j < len(chunk):
+            raw = chunk[j]
+            j += 1
+            m = re.match(r"([A-Za-z_][\w-]*):(?:\s+(.*))?$", raw.strip())
+            if indent(raw) != ki or not m or raw.lstrip().startswith("#"):
+                continue
+            key, val = m.group(1), (m.group(2) or "").strip()
+            block = []
+            while j < len(chunk) and deeper(chunk[j], ki):
+                block.append(chunk[j])
+                j += 1
+            if key == "env":
+                for e in block:
+                    name, _, v = e.strip().partition(":")
+                    if name and not name.startswith("#"):
+                        step["env"][name.strip()] = unquote(v)
+            elif key in ("name", "uses"):
+                step[key] = val
+            elif key == "run":
+                style = re.fullmatch(r"([|>])[+-]?\d*(?:\s+#.*)?", val)
+                if style:
+                    first = next((b for b in block if b.strip()), "")
+                    rows = [b[indent(first):] if b.strip() else ""
+                            for b in block]
+                    if style.group(1) == ">":  # folded: one line per paragraph
+                        rows = [" ".join(p.split("\n")) for p in
+                                "\n".join(rows).strip("\n").split("\n\n")]
+                    step["run"] = "\n".join(rows).strip("\n") + "\n"
+                else:
+                    parts = [val] + [b.strip() for b in block if b.strip()]
+                    step["run"] = unquote(" ".join(parts))
+        steps.append(step)
+    return steps
+
+
+def expand_expressions(text: str, context: dict) -> str:
+    """What GitHub does to `${{ expr }}` before a script ever runs: paste
+    the value into the text. An expression missing from `context` is a
+    KeyError, so a new one cannot slip in without this test seeing it."""
+    return re.sub(r"\$\{\{\s*([^}]*?)\s*\}\}",
+                  lambda m: context[m.group(1)], text)
+
+
+def unquoted_variable_uses(script: str, names) -> list:
+    """The `names` that bash `script` expands outside double quotes, where
+    the shell would split them at spaces and expand globs. A small scanner
+    for what the action's scripts use: '...', "...", $( ) nesting and
+    backslash escapes."""
+    found, stack, i = [], ["top"], 0
+    while i < len(script):
+        ch, ctx = script[i], stack[-1]
+        if ch == "\\":
+            i += 2
+        elif ch == "'" and ctx != "dq":
+            end = script.find("'", i + 1)
+            i = len(script) if end < 0 else end + 1
+        elif ch == '"':
+            stack.pop() if ctx == "dq" else stack.append("dq")
+            i += 1
+        elif ch == "$" and script.startswith("$(", i):
+            stack.append("cmd")
+            i += 2
+        elif ch == ")" and ctx == "cmd":
+            stack.pop()
+            i += 1
+        elif ch == "$" and re.match(r"\$\{?(\w+)", script[i:]):
+            m = re.match(r"\$\{?(\w+)", script[i:])
+            if m.group(1) in names and ctx != "dq":
+                found.append(m.group(1))
+            i += m.end()
+        else:
+            i += 1
+    return found
+
+
 class TestActionYml(unittest.TestCase):
     def test_structure(self):
         data = flat_yaml(action_text())
@@ -393,8 +519,10 @@ class TestActionYml(unittest.TestCase):
                 found += 1
                 self.assertIn(flag, known, f"`flakebox {cmd}` has no {flag}")
         self.assertGreaterEqual(found, 4)
-        # the input that feeds a CLI flag must spell that flag
-        self.assertIn('--min-runs "${{ inputs.min-runs }}"', text)
+        # the input that feeds a CLI flag must spell that flag, and reach
+        # it through the environment, never pasted into the script
+        self.assertIn('--min-runs "$FB_MIN_RUNS"', text)
+        self.assertIn("FB_MIN_RUNS: ${{ inputs.min-runs }}", text)
 
     def test_min_runs_input_feeds_a_valid_int(self):
         default = flat_yaml(action_text())["inputs"]["min-runs"]["default"]
@@ -403,6 +531,165 @@ class TestActionYml(unittest.TestCase):
                                "--min-runs", default)
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)["flaky"], [])
+
+
+class TestActionShellInjection(unittest.TestCase):
+    """R5-1: `${{ github.ref_name }}` and `${{ inputs.* }}` inside a `run:`
+    script are pasted into the bash text before bash reads it, so a branch
+    named  x";touch${IFS}pwned;echo"y  ran a command in the user's job.
+    Every expression belongs in the step's `env:`, read as a quoted
+    variable."""
+
+    # the panel's branch name (a legal git ref) and the other ways out of
+    # a quoted word
+    HOSTILE = ['x";touch${IFS}pwned;echo"y', "$(touch pwned)", "`touch pwned`",
+               "a b;touch pwned #", "';touch pwned;'", "x\ntouch pwned"]
+
+    def run_steps(self):
+        return [s for s in action_steps(action_text()) if s["run"] is not None]
+
+    def test_no_expression_inside_a_run_script(self):
+        steps = self.run_steps()
+        self.assertGreaterEqual(len(steps), 6)  # install, record, report, ...
+        for s in steps:
+            self.assertNotIn("${{", s["run"], f"step {s['name']!r} pastes an "
+                             f"expression into its script - use env:")
+
+    def test_the_scan_sees_every_shape_of_run(self):
+        sample = (
+            "runs:\n  using: composite\n  steps:\n"
+            "    # a comment before the first step\n"
+            "    - name: inline\n      shell: bash\n"
+            "      run: echo \"${{ github.ref_name }}\"\n"
+            "    - name: literal\n      shell: bash\n      run: |\n"
+            "        echo hi\n        echo \"${{ inputs.x }}\"\n"
+            "    - name: folded\n      shell: bash\n      run: >\n"
+            "        python3 -m x\n        --y \"${{ github.sha }}\"\n"
+            "    - run: echo \"${{ inputs.first-key }}\"\n      shell: bash\n"
+            "    - name: clean\n      shell: bash\n"
+            "      env:\n        REF: ${{ github.ref_name }}\n"
+            "      run: echo \"$REF\"\n"
+            "    - name: cache\n      uses: actions/cache/save@v4\n"
+            "      with:\n        key: ${{ inputs.k }}\n")
+        steps = action_steps(sample)
+        self.assertEqual([s["name"] for s in steps],
+                         ["inline", "literal", "folded", None, "clean", "cache"])
+        self.assertEqual([s["run"] is not None and "${{" in s["run"]
+                          for s in steps],
+                         [True, True, True, True, False, False])
+        self.assertEqual(steps[2]["run"], 'python3 -m x --y "${{ github.sha }}"\n')
+        self.assertEqual(steps[4]["env"], {"REF": "${{ github.ref_name }}"})
+        self.assertEqual(steps[5]["uses"], "actions/cache/save@v4")
+        self.assertIsNone(steps[5]["run"])
+
+    def test_the_real_steps_were_found(self):
+        steps = action_steps(action_text())
+        names = [s["name"] for s in steps]
+        for expected in ("Record results", "Report", "Export history (optional)",
+                         "Fail on new flakes (optional)"):
+            self.assertIn(expected, names)
+        record = steps[names.index("Record results")]
+        self.assertIn("flakebox record", record["run"])
+        self.assertGreaterEqual(len(steps), 8)
+
+    def test_variable_scanner(self):
+        names = {"A", "B"}
+        bad = lambda script: unquoted_variable_uses(script, names)
+        self.assertEqual(bad('echo "$A" "${B}" "x $A y"'), [])
+        self.assertEqual(bad('mkdir -p -- "$(dirname -- "$A")"'), [])
+        self.assertEqual(bad("echo $A"), ["A"])
+        self.assertEqual(bad('echo "$B" ${A}'), ["A"])
+        self.assertEqual(bad('echo "$(echo $A)"'), ["A"])
+        self.assertEqual(bad("echo '$A' \\$B $C"), [])  # quoted, escaped, other
+        self.assertEqual(bad('python3 -c "\nprint(\'$A\')\n" "$B"'), [])
+
+    def test_every_environment_value_is_read_quoted(self):
+        carriers = 0
+        for s in self.run_steps():
+            # the env entries that carry an expression into the script
+            names = {k for k, v in s["env"].items() if "${{" in v}
+            carriers += len(names)
+            for name in names:
+                self.assertRegex(s["run"], r"\$\{?" + name + r"\b",
+                                 f"step {s['name']!r}: {name} is never used")
+            self.assertEqual(
+                unquoted_variable_uses(s["run"], names), [],
+                f"step {s['name']!r} expands an environment value unquoted")
+        self.assertGreaterEqual(carriers, 8)
+
+    @unittest.skipIf(os.name == "nt" or shutil.which("bash") is None,
+                     "runs the scripts under a POSIX bash with shell shims")
+    def test_hostile_values_never_reach_the_shell(self):
+        """The attack itself: run the action's own scripts under bash, with
+        every expression a hostile string, the way the runner would."""
+        tmp = mktemp()
+        shims = os.path.join(tmp, "bin")
+        os.makedirs(shims)
+        shim_py = os.path.join(tmp, "shim.py")
+        write_raw(tmp, "shim.py", (
+            "import json, os, sys\n"
+            "tool, argv = sys.argv[1], sys.argv[2:]\n"
+            "if tool == 'pip' or argv[:2] == ['-m', 'flakebox']:\n"
+            "    with open(os.environ['FB_SHIM_LOG'], 'a', encoding='utf-8') as f:\n"
+            "        f.write(json.dumps([tool] + argv) + '\\n')\n"
+            "    if 'json' in argv:\n"
+            "        print('{\"flaky\": [], \"quarantined\": [], \"new\": []}')\n"
+            "    sys.exit(0)\n"
+            "os.execv(sys.executable, [sys.executable] + argv)\n"))
+        for tool in ("python3", "pip"):
+            shim = os.path.join(shims, tool)
+            write_raw(shims, tool, "#!/bin/sh\nexec %s %s %s \"$@\"\n" % (
+                shlex.quote(sys.executable), shlex.quote(shim_py), tool))
+            os.chmod(shim, 0o755)
+        for value in self.HOSTILE:
+            work = os.path.join(tmp, f"w{self.HOSTILE.index(value)}")
+            os.makedirs(work)
+            log = os.path.join(work, "calls.log")
+            summary = os.path.join(work, "summary.md")
+            output = os.path.join(work, "output.txt")
+            context = {e: value for e in (
+                "inputs.junit", "inputs.min-runs", "inputs.quarantine-output",
+                "inputs.export-output", "github.sha", "github.ref_name",
+                "github.action_path", "steps.report.outputs.new_flaky")}
+            for step in self.run_steps():
+                env = {"PATH": shims + os.pathsep + os.environ.get("PATH", ""),
+                       "HOME": _fake_home, "FB_SHIM_LOG": log,
+                       "GITHUB_STEP_SUMMARY": summary, "GITHUB_OUTPUT": output}
+                env.update({k: expand_expressions(v, context)
+                            for k, v in step["env"].items()})
+                proc = subprocess.run(
+                    ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail",
+                     "-c", expand_expressions(step["run"], context)],
+                    cwd=work, env=env, capture_output=True, text=True,
+                    timeout=120)
+                what = f"{step['name']} with {value!r}: {proc.stderr}"
+                self.assertFalse(os.path.exists(os.path.join(work, "pwned")),
+                                 f"a command ran: {what}")
+                if step["name"].startswith("Fail on new flakes"):
+                    self.assertEqual(proc.returncode, 1, what)
+                    self.assertEqual(
+                        proc.stdout,
+                        f"::error::flakebox detected {value} new flaky test(s)\n")
+                else:
+                    self.assertEqual(proc.returncode, 0, what)
+            with open(log, encoding="utf-8") as f:
+                calls = [json.loads(ln) for ln in f.read().splitlines()]
+            # every hostile string arrived as exactly one argument
+            self.assertEqual(calls, [
+                ["pip", "install", value],
+                ["python3", "-m", "flakebox", "record", "--junit", value,
+                 "--commit", value, "--branch", value],
+                ["python3", "-m", "flakebox", "report", "--min-runs", value],
+                ["python3", "-m", "flakebox", "report", "--format", "json",
+                 "--min-runs", value],
+                ["python3", "-m", "flakebox", "quarantine", "--format", "json",
+                 "--min-runs", value],
+                ["python3", "-m", "flakebox", "export", "--out", value]],
+                f"for {value!r}")
+            with open(output, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "new_flaky=0\n")
+            # the output paths are used as one file name each
+            self.assertTrue(os.path.isfile(os.path.join(work, value)), value)
 
 
 def argparse_sub_type():
@@ -432,9 +719,76 @@ class TestNoYamlDependency(unittest.TestCase):
                 "flakebox.junit, flakebox.quarantine, flakebox.store\n"
                 "print(flakebox.cli.VERSION)")
         proc = subprocess.run([sys.executable, "-c", code], cwd=REPO,
-                              capture_output=True, text=True, timeout=60)
+                              capture_output=True, text=True, timeout=60,
+                              env=child_env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), cli_mod.VERSION)
+
+
+class TestChildProcessEnvironment(unittest.TestCase):
+    """A test that starts a real interpreter must not depend on how the
+    harness running it is configured. PYTHONUNBUFFERED is the one that
+    matters: it moves a child's failed stdout write from the flush (what
+    TestBrokenPipe is about) to the print, so the test would quietly check
+    something else."""
+
+    @staticmethod
+    def is_os_environ(node) -> bool:
+        return (isinstance(node, ast.Attribute) and node.attr == "environ"
+                and isinstance(node.value, ast.Name) and node.value.id == "os")
+
+    def test_child_env_drops_pythonunbuffered_and_keeps_the_rest(self):
+        saved = os.environ.get("PYTHONUNBUFFERED")
+        os.environ["PYTHONUNBUFFERED"] = "1"
+        try:
+            env = child_env(FB_EXTRA="x")
+        finally:
+            if saved is None:
+                os.environ.pop("PYTHONUNBUFFERED", None)
+            else:
+                os.environ["PYTHONUNBUFFERED"] = saved
+        self.assertNotIn("PYTHONUNBUFFERED", env)
+        self.assertEqual(env["FB_EXTRA"], "x")
+        self.assertEqual(env["HOME"], _fake_home)  # the fake home reaches the child
+        self.assertEqual(env.get("PATH"), os.environ.get("PATH"))
+        env["FB_EXTRA"] = "y"  # a copy: this process is untouched
+        self.assertNotIn("FB_EXTRA", os.environ)
+
+    def test_no_subprocess_in_this_file_inherits_the_environment_unfiltered(self):
+        with open(os.path.join(REPO, "tests", "test_flakebox.py"),
+                  encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        problems = []
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "subprocess"
+                    and node.func.attr in ("run", "Popen", "check_output",
+                                           "check_call", "call")
+                    and not any(k.arg == "env" for k in node.keywords)):
+                problems.append(f"line {node.lineno}: subprocess."
+                                f"{node.func.attr}() has no env=")
+        for top in tree.body:
+            if isinstance(top, ast.FunctionDef) and top.name == "child_env":
+                continue  # the one place that may read the whole environment
+            for node in ast.walk(top):
+                inherits = False
+                if isinstance(node, ast.Call):
+                    fn = node.func
+                    inherits = (
+                        (isinstance(fn, ast.Name) and fn.id == "dict"
+                         and len(node.args) == 1
+                         and self.is_os_environ(node.args[0]))
+                        or (isinstance(fn, ast.Attribute) and fn.attr == "copy"
+                            and self.is_os_environ(fn.value)))
+                elif isinstance(node, ast.Dict):
+                    inherits = any(k is None and self.is_os_environ(v)
+                                   for k, v in zip(node.keys, node.values))
+                if inherits:
+                    problems.append(f"line {node.lineno}: copies the whole "
+                                    f"environment without child_env()")
+        self.assertEqual(problems, [])
 
 
 # --------------------------------------------------------------------------
@@ -755,6 +1109,13 @@ DOCTYPE_BOMB = """<?xml version="1.0"?>
 </testsuite>"""
 
 ENTITY_DECL = """<?xml version="1.0"?>
+<!DOCTYPE testsuite [<!ENTITY lol "lollollollol">]>
+<testsuite name="pytest" tests="1">
+  <testcase classname="a" name="t" time="0.1">&lol;</testcase>
+</testsuite>"""
+
+# an ENTITY declaration where none can be: not XML at all, so not a DTD either
+STRAY_ENTITY = """<?xml version="1.0"?>
 <testsuite name="pytest" tests="1">
   <!ENTITY lol "lollollollol">
   <testcase classname="a" name="t" time="0.1"/>
@@ -785,9 +1146,12 @@ class TestXmlBombGuard(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ENTITY"):
             junit_mod.parse(p)
 
-    def test_rejection_is_case_insensitive(self):
+    def test_a_lowercase_doctype_is_refused_too(self):
+        # not a DOCTYPE to expat (keywords are case-sensitive), so it is
+        # refused as not well-formed instead; either way nothing is parsed
+        from xml.etree.ElementTree import ParseError
         p = write_raw(mktemp(), "lower.xml", LOWERCASE_DOCTYPE)
-        with self.assertRaises(ValueError):
+        with self.assertRaises((ValueError, ParseError)):
             junit_mod.parse(p)
 
     def test_cli_record_rejects_bomb_with_exit_2(self):
@@ -805,7 +1169,122 @@ class TestXmlBombGuard(unittest.TestCase):
         self.assertEqual(len(rs), 4)
 
 
+ENCODINGS = ("utf-8", "utf-16", "utf-16-le", "utf-16-be", "latin-1")
+
+
+def declared(xml: str, enc: str) -> str:
+    """`xml` with the encoding its declaration names set to match `enc`
+    (the -le / -be forms are written without a byte order mark)."""
+    name = ("utf-16" if enc.startswith("utf-16") else
+            "iso-8859-1" if enc == "latin-1" else enc)
+    return xml.replace("utf-8", name)
+
+
+def suite_xml(inner: str = "", prolog: str = "") -> str:
+    """A one-test JUnit report; `inner` goes inside the testcase."""
+    return (f'<?xml version="1.0" encoding="utf-8"?>{prolog}'
+            f'<testsuite name="s"><testcase classname="a" name="t" time="0.1">'
+            f'{inner}</testcase></testsuite>')
+
+
+class TestDtdGuardScope(unittest.TestCase):
+    """R5-4: the guard was a raw, case-insensitive scan of every byte of the
+    file, so a report whose captured output merely CONTAINS the text
+    "<!DOCTYPE html>" (a CDATA section, a comment, escaped text) was refused
+    as a possible XML bomb. Only a declaration is one: expat now tokenises,
+    and the document is stopped at the first DOCTYPE or ENTITY."""
+
+    def mentions(self) -> dict:
+        return {
+            "cdata": suite_xml('<system-out><![CDATA[<!DOCTYPE html><html>'
+                               '<!ENTITY x "y"></html>]]></system-out>'),
+            "cdata in a failure": suite_xml(
+                '<failure message="m"><![CDATA[<!DOCTYPE html>]]></failure>'),
+            "escaped text": suite_xml(
+                "<system-out>&lt;!DOCTYPE html&gt;</system-out>"),
+            "escaped attribute": suite_xml().replace(
+                'name="t"', 'name="&lt;!DOCTYPE html&gt;"'),
+            "comment": suite_xml("<!-- <!DOCTYPE html> <!ENTITY a 'b'> -->"),
+            "comment in the prolog": suite_xml(
+                prolog="<!-- <!DOCTYPE html> -->"),
+            "processing instruction": suite_xml(
+                prolog="<?note <!DOCTYPE html> ?>"),
+        }
+
+    def test_text_that_mentions_a_doctype_is_not_a_declaration(self):
+        for name, xml in self.mentions().items():
+            rs = junit_mod.parse_bytes(xml.encode("utf-8"), name + ".xml")
+            self.assertEqual([r["outcome"] for r in rs],
+                             ["failed" if "failure" in name else "passed"], name)
+
+    def test_the_same_in_every_encoding_expat_reads(self):
+        for enc in ENCODINGS:
+            for name, xml in self.mentions().items():
+                raw = declared(xml, enc).encode(enc)
+                self.assertEqual(
+                    len(junit_mod.parse_bytes(raw, f"{name}-{enc}.xml")), 1,
+                    f"{name} as {enc}")
+
+    def test_cli_record_accepts_a_report_that_mentions_a_doctype(self):
+        tmp = mktemp()
+        p = write_raw(tmp, "html.xml", self.mentions()["cdata"])
+        code, out, err = run_cli("--db", os.path.join(tmp, "h.db"),
+                                 "record", "--junit", p)
+        self.assertEqual(code, 0, err)
+        self.assertIn("recorded run 1: 1 tests", out)
+
+    def test_real_declarations_are_still_refused(self):
+        entities = ('<!DOCTYPE s [<!ENTITY a "x"><!ENTITY b "&a;&a;&a;">]>')
+        shapes = {
+            "doctype only": "<!DOCTYPE s>",
+            "external dtd": '<!DOCTYPE s SYSTEM "http://127.0.0.1/s.dtd">',
+            "public dtd": '<!DOCTYPE s PUBLIC "-//X//EN" "s.dtd">',
+            "internal subset": entities,
+            "after a comment": "<!-- c -->" + entities,
+            "after a processing instruction": "<?pi x?>" + entities,
+            "with surrounding whitespace": "\n  " + entities + "\n",
+        }
+        for name, prolog in shapes.items():
+            for enc in ENCODINGS:
+                raw = declared(suite_xml(prolog=prolog), enc).encode(enc)
+                with self.assertRaisesRegex(ValueError, "DOCTYPE",
+                                            msg=f"{name} as {enc}"):
+                    junit_mod.parse_bytes(raw, "x.xml")
+        # with a byte order mark, and as the very first thing in the file
+        with self.assertRaisesRegex(ValueError, "DOCTYPE"):
+            junit_mod.parse_bytes(b"\xef\xbb\xbf" + b"<!DOCTYPE s><s/>", "x.xml")
+
+    def test_a_billion_laughs_document_is_refused_before_it_is_expanded(self):
+        levels = "".join('<!ENTITY l%d "%s">' % (i, ("&l%d;" % (i - 1)) * 10)
+                         for i in range(1, 10))
+        xml = ('<?xml version="1.0"?><!DOCTYPE s [<!ENTITY l0 "lol">' + levels
+               + ']><testsuite><testcase classname="a" name="&l9;"/></testsuite>')
+        with self.assertRaisesRegex(ValueError, "DOCTYPE"):
+            junit_mod.parse_bytes(xml.encode("utf-8"), "laughs.xml")
+
+    def test_not_well_formed_is_a_parse_error_not_a_dtd_claim(self):
+        from xml.etree.ElementTree import ParseError
+        for name, raw in {"stray entity declaration": STRAY_ENTITY,
+                          "lowercase doctype": LOWERCASE_DOCTYPE,
+                          "garbage": "not xml", "empty": ""}.items():
+            with self.assertRaises(ParseError, msg=name):
+                junit_mod.parse_bytes(raw.encode("utf-8"), "bad.xml")
+        tmp = mktemp()
+        code, _, err = run_cli("--db", os.path.join(tmp, "h.db"), "record",
+                               "--junit", write_raw(tmp, "stray.xml", STRAY_ENTITY))
+        self.assertEqual(code, 2)
+        self.assertIn("cannot parse", err)
+        self.assertNotIn("Traceback", err)
+
+
 class TestPackaging(unittest.TestCase):
+    def test_version_in_pyproject_matches_the_code_on_every_python(self):
+        # no tomllib here (3.11+): read the one line
+        with open(os.path.join(REPO, "pyproject.toml"), encoding="utf-8") as f:
+            m = re.search(r'(?m)^version = "([^"]+)"\s*$', f.read())
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), cli_mod.VERSION)
+
     def test_pyproject_metadata(self):
         try:
             import tomllib
@@ -919,17 +1398,27 @@ def reference_analyze(conn, min_runs=5, stable_runs=10, window=50,
                       retire_after=3):
     """Independent per-test (N+1) implementation of the detection rules
     (see detect.py's docstring), kept as the oracle for the batched
-    analyze(): same classification, same counts, same order."""
+    analyze(): same classification, same counts, same order. Recency is
+    worked out here, in Python, from (created_at, id) - not by the SQL the
+    code under test uses."""
     flaky, broken, stable, retired = [], [], [], []
-    recent = [r[0] for r in conn.execute(
-        "SELECT id FROM runs ORDER BY id DESC LIMIT ?", (retire_after,))]
+    never = float("-inf")  # a run without a timestamp is the oldest
+    newest_first = sorted(
+        conn.execute("SELECT id, created_at FROM runs").fetchall(),
+        key=lambda r: (never if r[1] is None else r[1], r[0]), reverse=True)
+    rank = {run_id: n for n, (run_id, _) in enumerate(newest_first)}
+    recent = [run_id for run_id, _ in newest_first[:max(retire_after, 0)]]
     all_ids = [r[0] for r in conn.execute(
         "SELECT DISTINCT test_id FROM results ORDER BY rowid")]
     for tid in all_ids:
-        hist = store_mod.test_history(conn, tid, limit=window)  # newest first
-        last_run = conn.execute(
-            "SELECT MAX(run_id) FROM results WHERE test_id = ?", (tid,)).fetchone()[0]
-        outcomes = [h["outcome"] for h in hist]
+        seen = sorted((rank[run_id], run_id, outcome) for run_id, outcome in
+                      conn.execute("SELECT run_id, outcome FROM results "
+                                   "WHERE test_id = ?", (tid,))
+                      if run_id in rank)[:max(window, 0)]  # newest first
+        if not seen:
+            continue
+        last_run = seen[0][1]
+        outcomes = [o for _, _, o in seen]
         passes = sum(1 for o in outcomes if o == "passed")
         fails = sum(1 for o in outcomes if o in ("failed", "error"))
         skips = sum(1 for o in outcomes if o == "skipped")
@@ -947,7 +1436,7 @@ def reference_analyze(conn, min_runs=5, stable_runs=10, window=50,
              "flake_rate": (fails / executed) if executed else 0.0,
              "pass_streak": streak, "status": status, "test_id": tid,
              "quarantined": store_mod.is_quarantined(conn, tid)}
-        if recent and last_run < min(recent):
+        if recent and last_run not in recent:
             s["retired"] = True
             s["last_run"] = last_run
             s["last_commit"] = conn.execute(
@@ -966,23 +1455,26 @@ def reference_analyze(conn, min_runs=5, stable_runs=10, window=50,
             stable.append(s)
     flaky.sort(key=lambda s: (-s["flake_rate"], -s["failures"]))
     broken.sort(key=lambda s: -s["failures"])
-    retired.sort(key=lambda s: (-s["last_run"], s["test_id"]))
+    retired.sort(key=lambda s: (rank[s["last_run"]], s["test_id"]))
     return {"flaky": flaky, "broken": broken, "stable": stable,
             "retired": retired}
 
 
-def make_equivalence_db(tmp: str) -> str:
+EQUIVALENCE_QUARANTINED = (3, 37, 66, 99, 121, 130, 140)
+
+
+def equivalence_history() -> list:
     """~3.6k rows of seeded-random history incl. quarantined, flaky,
-    broken, skip-heavy, and late-joiner (< min_runs) tests."""
+    broken, skip-heavy, and late-joiner (< min_runs) tests, as
+    [(commit, results)] for its runs, oldest first."""
     rng = random.Random(20261015)
-    db = os.path.join(tmp, "eq.db")
-    conn = store_mod.connect(db)
     n_tests, n_runs = 150, 24
     kinds = []
     for _ in range(n_tests):
         r = rng.random()
         kinds.append("pass" if r < 0.4 else "fail" if r < 0.6 else
                      "flaky" if r < 0.9 else "skippy")
+    runs = []
     for run in range(n_runs):
         results = []
         for i, kind in enumerate(kinds):
@@ -1002,9 +1494,17 @@ def make_equivalence_db(tmp: str) -> str:
             else:
                 outcome = rng.choice(["passed", "skipped"])
             results.append(result(tid, outcome))
-        store_mod.record_run(conn, results, commit_sha=f"sha{run}")
+        runs.append((f"sha{run}", results))
+    return runs
+
+
+def make_equivalence_db(tmp: str) -> str:
+    db = os.path.join(tmp, "eq.db")
+    conn = store_mod.connect(db)
+    for commit, results in equivalence_history():
+        store_mod.record_run(conn, results, commit_sha=commit)
     # quarantine a spread across kinds
-    for i in (3, 37, 66, 99, 121, 130, 140):
+    for i in EQUIVALENCE_QUARANTINED:
         store_mod.quarantine_add(conn, f"mod{i:03d}::test_{i:03d}", "auto")
     conn.close()
     return db
@@ -1083,6 +1583,157 @@ class TestAnalyzeBatchEquivalence(unittest.TestCase):
         conn.close()
         self.assertLess(len(new_calls), len(old_calls),
                         f"new={len(new_calls)} old={len(old_calls)}")
+
+
+def verdicts(analysis: dict) -> dict:
+    """An analyze() result keyed by test, without the run ids (which depend
+    on the order the runs arrived in) - what must not depend on it."""
+    return {bucket: {s["test_id"]: {k: v for k, v in s.items() if k != "last_run"}
+                     for s in analysis[bucket]}
+            for bucket in analysis}
+
+
+class TestRecencyOrder(unittest.TestCase):
+    """R5-2: "the newest N runs" was the N highest row ids, but an import
+    appends rows, so older runs imported after newer local ones got the
+    higher ids: a test that ran in every local run was reported retired and
+    a recovered one flaky. Recency is the run's created_at; the row id only
+    breaks ties."""
+
+    def local_db(self, tmp: str) -> str:
+        db = os.path.join(tmp, "local.db")
+        conn = store_mod.connect(db)
+        for i in range(10):  # the newest runs, recorded here
+            store_mod.record_run(conn, [result("t::live", "passed"),
+                                        result("t::flaky", "passed")],
+                                 commit_sha=f"new{i}", created_at=1000 + i)
+        conn.close()
+        return db
+
+    def older_export(self, tmp: str) -> str:
+        return write_raw(tmp, "older.json", json.dumps({
+            "flakebox_export": 1, "quarantine": [],
+            "runs": [{"commit": f"old{i}", "branch": None,
+                      "created_at": 100 + i, "report_sha": f"old-report-{i}",
+                      "results": [["t::flaky", "failed", 1, ""],
+                                  ["t::old", "failed", 1, ""]]}
+                     for i in range(10)]}))
+
+    def test_importing_an_older_export_does_not_make_old_runs_new(self):
+        tmp = mktemp()
+        db = self.local_db(tmp)
+        code, out, _ = run_cli("--db", db, "import", self.older_export(tmp))
+        self.assertEqual(code, 0)
+        self.assertIn("imported 10 run(s)", out)
+        code, out, _ = run_cli("--db", db, "report", "--format", "json")
+        a = json.loads(out)
+        # t::live ran in all of the newest runs; t::old only in the old ones
+        self.assertEqual([s["test_id"] for s in a["retired"]], ["t::old"])
+        self.assertEqual(a["retired"][0]["last_commit"], "old9")
+        # t::flaky failed ten times long ago and has passed ten times since
+        self.assertEqual(a["flaky"], [])
+        self.assertEqual(a["broken"], [])
+        conn = store_mod.connect(db)
+        try:
+            hist = store_mod.test_history(conn, "t::flaky", limit=12)
+            self.assertEqual([h["commit"] for h in hist],
+                             [f"new{i}" for i in range(9, -1, -1)]
+                             + ["old9", "old8"])
+            self.assertEqual(detect_mod.summarize(conn, "t::flaky")["status"],
+                             detect_mod.RECOVERED)
+            self.assertFalse(detect_mod.summarize(conn, "t::live")["retired"])
+            self.assertTrue(detect_mod.summarize(conn, "t::old")["retired"])
+            # the imported runs kept the time they were recorded at
+            self.assertEqual(
+                [r[0] for r in conn.execute(
+                    "SELECT created_at FROM runs WHERE commit_sha LIKE 'old%' "
+                    "ORDER BY id")], list(range(100, 110)))
+            newest = [conn.execute("SELECT commit_sha FROM runs WHERE id = ?",
+                                   (rid,)).fetchone()[0]
+                      for rid in store_mod.recent_run_ids(conn, 3)]
+            self.assertEqual(newest, ["new9", "new8", "new7"])
+        finally:
+            conn.close()
+        # the CLI's history command agrees
+        code, out, _ = run_cli("--db", db, "history", "--test", "t::flaky")
+        self.assertIn("t::flaky: recovered (10 consecutive passes)", out)
+
+    def test_arrival_order_never_changes_a_verdict(self):
+        tmp = mktemp()
+        runs = equivalence_history()
+        n = len(runs)
+        shuffled = list(range(n))
+        random.Random(7).shuffle(shuffled)
+        orders = {"oldest first": list(range(n)),
+                  "newest first": list(range(n))[::-1],
+                  "shuffled": shuffled}
+        kw = dict(min_runs=5, stable_runs=5, window=10)
+        seen, histories = {}, {}
+        for name, arrival in orders.items():
+            db = os.path.join(tmp, name.replace(" ", "_") + ".db")
+            conn = store_mod.connect(db)
+            for k in arrival:  # run k was made at 1000 + 10 * k
+                commit, results = runs[k]
+                store_mod.record_run(conn, results, commit_sha=commit,
+                                     created_at=1000 + 10 * k)
+            for i in EQUIVALENCE_QUARANTINED:
+                store_mod.quarantine_add(conn, f"mod{i:03d}::test_{i:03d}", "auto")
+            try:
+                a = detect_mod.analyze(conn, **kw)
+                # the batched query and the per-test oracle agree on this DB
+                self.assertEqual(a, reference_analyze(conn, **kw), name)
+                live = detect_mod.analyze(conn, retire_after=0, **kw)
+                self.assertEqual(live, reference_analyze(
+                    conn, retire_after=0, **kw), name)
+                histories[name] = {
+                    tid: [h["commit"] for h in
+                          store_mod.test_history(conn, tid, limit=10)]
+                    for tid in ("mod000::test_000", "mod060::test_060",
+                                "mod140::test_140", "mod147::test_147")}
+            finally:
+                conn.close()
+            seen[name] = verdicts(a)
+        base = seen["oldest first"]
+        self.assertEqual(len(base["retired"]), 7)
+        for bucket in ("flaky", "broken", "stable"):
+            self.assertTrue(base[bucket], bucket)
+        self.assertEqual(seen["newest first"], base)
+        self.assertEqual(seen["shuffled"], base)
+        self.assertEqual(histories["newest first"], histories["oldest first"])
+        self.assertEqual(histories["shuffled"], histories["oldest first"])
+        self.assertEqual(histories["oldest first"]["mod000::test_000"],
+                         [f"sha{k}" for k in range(n - 1, n - 11, -1)])
+
+    def test_equal_timestamps_fall_back_to_the_order_runs_arrived_in(self):
+        conn = store_mod.connect(":memory:")
+        for i in range(4):
+            store_mod.record_run(conn, [result("t::x", "passed")],
+                                 commit_sha=f"c{i}", created_at=500)
+        self.assertEqual([h["commit"] for h in
+                          store_mod.test_history(conn, "t::x")],
+                         ["c3", "c2", "c1", "c0"])
+        self.assertEqual(store_mod.recent_run_ids(conn, 2), [4, 3])
+        conn.close()
+
+    def test_a_run_exported_without_a_timestamp_is_imported_as_the_oldest(self):
+        tmp = mktemp()
+        db = os.path.join(tmp, "u.db")
+        conn = store_mod.connect(db)
+        store_mod.record_run(conn, [result("t::x", "passed")],
+                             commit_sha="local", created_at=1000)
+        conn.close()
+        exp = write_raw(tmp, "undated.json", json.dumps({
+            "flakebox_export": 1, "quarantine": [],
+            "runs": [{"commit": "undated", "report_sha": "u1",
+                      "created_at": None,
+                      "results": [["t::x", "failed", 1, ""]]}]}))
+        code, out, _ = run_cli("--db", db, "import", exp)
+        self.assertEqual(code, 0)
+        conn = store_mod.connect(db)
+        self.assertEqual([h["commit"] for h in
+                          store_mod.test_history(conn, "t::x")],
+                         ["local", "undated"])
+        conn.close()
 
 
 class TestVersionFlag(unittest.TestCase):
@@ -1344,7 +1995,7 @@ class TestDeselectNodeIds(unittest.TestCase):
                 [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
                  "--junitxml", report, "t"] + extra,
                 cwd=tmp, capture_output=True, text=True, timeout=120,
-                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+                env=child_env(PYTHONDONTWRITEBYTECODE="1"))
             self.assertIn(proc.returncode, (0, 5), proc.stdout + proc.stderr)
             return sorted(r["test_id"] for r in junit_mod.parse(report))
 
@@ -1414,6 +2065,56 @@ class TestJunitShapes(unittest.TestCase):
         with open(p, "wb") as f:
             f.write(ok.encode("utf-16"))
         self.assertEqual(junit_mod.parse(p)[0]["test_id"], "a::t")
+
+
+class TestDurationValues(unittest.TestCase):
+    """R5-3: `duration_ms("inf")` raised OverflowError (only ValueError was
+    caught), so a report with one such `time` was rejected whole although
+    the README promises 0 and a warning; a negative time was stored as a
+    negative duration, and `1e300` crashed `record` when SQLite refused the
+    integer."""
+
+    UNUSABLE = ("inf", "-inf", "+inf", "Infinity", "nan", "1e999", "-1e999",
+                "-5", "-0.001", "1e300", "1e16", "fast", "1e308")
+
+    def test_unusable_times_are_zero_with_one_warning_each(self):
+        for text in self.UNUSABLE:
+            warnings: list = []
+            self.assertEqual(
+                junit_mod.duration_ms(text, "a::t", warn=warnings.append), 0, text)
+            self.assertEqual(len(warnings), 1, text)
+            self.assertIn("a::t", warnings[0])
+            self.assertIn(repr(text), warnings[0])
+
+    def test_usable_times_are_unchanged_and_silent(self):
+        cases = {"0.5": 500, "0,5": 500, "86400": 86400000, "0": 0, "-0": 0,
+                 "": 0, "  2  ": 2000, "1e3": 1000000, "9e15": 9000000000000000000}
+        for text, expected in cases.items():
+            warnings: list = []
+            self.assertEqual(
+                junit_mod.duration_ms(text, "a::t", warn=warnings.append),
+                expected, text)
+            self.assertEqual(warnings, [], text)
+        self.assertEqual(junit_mod.duration_ms(None), 0)
+
+    def test_record_keeps_the_report_and_stores_zero(self):
+        tmp = mktemp()
+        cases = ["inf", "-5", "1e300", "nan", "0.25"]
+        xml = "<testsuite>" + "".join(
+            f'<testcase classname="a" name="t{i}" time="{t}"/>'
+            for i, t in enumerate(cases)) + "</testsuite>"
+        p = write_raw(tmp, "weird.xml", xml)
+        db = os.path.join(tmp, "h.db")
+        code, out, err = run_cli("--db", db, "record", "--junit", p)
+        self.assertEqual(code, 0, err)
+        self.assertIn("recorded run 1: 5 tests", out)
+        self.assertEqual(err.count("warning"), 4, err)
+        self.assertIn("a::t0", err)
+        conn = store_mod.connect(db)
+        durations = [r[0] for r in conn.execute(
+            "SELECT duration_ms FROM results ORDER BY rowid")]
+        conn.close()
+        self.assertEqual(durations, [0, 0, 0, 0, 250])
 
 
 class TestCorruptDb(unittest.TestCase):
@@ -1544,15 +2245,28 @@ class TestDocsAndDeadCode(unittest.TestCase):
         self.assertIn("pip install git+https://github.com/calasdan-sketch/flakebox", readme)
         self.assertNotIn("git clone <repo>", readme)
         self.assertNotRegex(readme, r"(?m)^\s*#?\s*(?:or: )?alias ")
-        m = re.search(r"# (\d+) tests", readme)
-        self.assertIsNotNone(m)
-        suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
-        self.assertEqual(int(m.group(1)), suite.countTestCases())
+        # a hard-coded test count goes stale with the next test (it said
+        # 90 while `unittest discover` ran 97)
+        self.assertNotRegex(readme, r"\b\d+ tests?\b")
         for phrase in ("flakebox export", "flakebox import", "quarantine-output",
                        "export-output", "retired", "--retire-after", "best effort",
                        "flakebox report --db", "already recorded", "--force",
-                       "PowerShell", "fingerprint", "recovered"):
-            self.assertIn(phrase, readme, phrase)
+                       "PowerShell", "fingerprint", "recovered",
+                       "refused as a whole before anything is written"):
+            self.assertIn(phrase, " ".join(readme.split()), phrase)
+
+    def test_readme_does_not_promise_what_a_bare_substitution_cannot_do(self):
+        """R5-5: `pytest $(...)` splits an id at its space (see
+        TestDeselectInTheShell); only `eval` re-parses the quoting."""
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            raw = f.read()
+        flat = " ".join(raw.split())
+        self.assertIn('eval "pytest $(flakebox quarantine --format deselect)"', flat)
+        self.assertIn("A bare `pytest $(flakebox quarantine --format deselect)` "
+                      "does not", flat)
+        self.assertNotIn("survives `pytest $(...)` as one argument", flat)
+        # no usage line runs the substitution bare
+        self.assertNotRegex(raw, r"(?m)^pytest \$\(")
 
 
 # ---------------------------------------------------------------------------
@@ -1582,7 +2296,7 @@ def pytest_outcomes(cwd: str, extra: list) -> dict:
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
          "--junitxml", report, "tests"] + extra,
         cwd=cwd, capture_output=True, text=True, timeout=120,
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+        env=child_env(PYTHONDONTWRITEBYTECODE="1"))
     assert proc.returncode in (0, 5), proc.stdout + proc.stderr
     return {r["test_id"]: r["outcome"] for r in junit_mod.parse(report)}
 
@@ -1674,7 +2388,8 @@ class TestDeselectQuoting(unittest.TestCase):
         write_raw(tdir, "test_c.py", PARAM_TESTS)
         line = quar_mod.deselect_line(["tests.test_c::test_param[a b]",
                                        "tests.test_c::test_version[1.5]"])
-        # what `pytest $(flakebox quarantine --format deselect)` hands pytest
+        # what `eval "pytest $(flakebox quarantine --format deselect)"` hands
+        # pytest (a bare $(...) would split the id at its space)
         words = shlex.split(line, posix=(os.name != "nt"))
         if os.name == "nt":
             words = [w.strip('"') for w in words]
@@ -1682,6 +2397,80 @@ class TestDeselectQuoting(unittest.TestCase):
         self.assertEqual(sorted(outcomes), [
             "tests.test_c::test_param[c.d/e]", "tests.test_c::test_plain",
             "tests.test_c::test_unrelated[0.5]", "tests.test_c::test_version[2.0]"])
+
+
+@unittest.skipIf(os.name == "nt" or shutil.which("sh") is None,
+                 "drives a POSIX shell; on Windows the line is quoted for cmd.exe")
+class TestDeselectInTheShell(unittest.TestCase):
+    """R5-5: the README said a parametrised id with a space survives
+    `pytest $(flakebox quarantine --format deselect)` as one argument. It
+    does not: command substitution splits the output at whitespace and never
+    removes the quotes the line carries. `eval` parses the line again and
+    does hand pytest every id intact. These tests run the real shell."""
+
+    NASTY = ["tests.test_c::test_param[a b]",
+             "tests.test_c::test_param[$x;y]",
+             "tests.test_c::test_param[$(touch pwned)]",
+             "tests.test_c::test_param[`touch pwned`]",
+             "tests.test_c::test_param[it's]",
+             'tests.test_c::test_param["q"]',
+             "tests.test_c::test_param[back\\slash]",
+             "tests.test_c::test_param[*?[x]]",
+             "tests.test_c::test_param[tab\there]",
+             "tests.test_c::test_param[line\nbreak]",
+             "tests.test_c::test_plain"]
+    # `pytest` prints its arguments NUL-separated; `flakebox` is this checkout
+    PRELUDE = ('pytest() { for a in "$@"; do printf "%s\\0" "$a"; done; }\n'
+               'flakebox() { "$FB_PYTHON" -m flakebox "$@"; }\n')
+
+    def quarantine_db(self, tmp: str, ids) -> str:
+        db = os.path.join(tmp, "q.db")
+        conn = store_mod.connect(db)
+        for tid in ids:
+            store_mod.quarantine_add(conn, tid)
+        conn.close()
+        return db
+
+    def shell(self, tmp: str, script: str, db: str) -> list:
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": _fake_home,
+               "FB_PYTHON": sys.executable, "FB_DB": db, "PYTHONPATH": REPO}
+        proc = subprocess.run(["sh", "-c", self.PRELUDE + script], cwd=tmp,
+                              env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.split("\0")[:-1]
+
+    def test_eval_hands_pytest_every_id_intact_and_runs_nothing(self):
+        tmp = mktemp()
+        db = self.quarantine_db(tmp, self.NASTY)
+        # the README's command, verbatim (plus --db)
+        words = self.shell(
+            tmp, 'eval "pytest $(flakebox --db "$FB_DB" quarantine '
+                 '--format deselect 2>/dev/null)"', db)
+        self.assertEqual(words, quar_mod.deselect_args(self.NASTY))
+        self.assertEqual(len(words), 2 * len(self.NASTY))
+        self.assertFalse(os.path.exists(os.path.join(tmp, "pwned")))
+
+    def test_bare_command_substitution_splits_an_id_with_a_space(self):
+        tmp = mktemp()
+        db = self.quarantine_db(tmp, ["tests.test_c::test_param[a b]"])
+        words = self.shell(
+            tmp, 'pytest $(flakebox --db "$FB_DB" quarantine --format deselect '
+                 '2>/dev/null)', db)
+        # what the README used to promise was one argument arrives in two
+        # pieces, the line's quotes still attached
+        self.assertEqual(words, ["--deselect", "'tests/test_c.py::test_param[a",
+                                 "b]'"])
+        self.assertNotEqual(words, quar_mod.deselect_args(
+            ["tests.test_c::test_param[a b]"]))
+
+    def test_plain_ids_need_no_eval(self):
+        tmp = mktemp()
+        ids = ["tests.test_a.TestA::test_flaky", "tests.test_b::test_broken"]
+        db = self.quarantine_db(tmp, ids)
+        words = self.shell(
+            tmp, 'pytest $(flakebox --db "$FB_DB" quarantine --format deselect '
+                 '2>/dev/null)', db)
+        self.assertEqual(words, quar_mod.deselect_args(ids))
 
 
 class TestExportValidation(unittest.TestCase):
@@ -1725,6 +2514,300 @@ class TestExportValidation(unittest.TestCase):
         code, out, _ = run_cli("--db", db, "import", p)
         self.assertEqual(code, 0)
         self.assertIn("imported 1 run(s)", out)
+
+    # R5-6: results[i][2] (duration_ms), results[i][3] (message) and a
+    # quarantine entry's reason / at were never checked, so a file with a
+    # bad value there passed the upfront check and failed halfway through
+    # the import (after earlier runs were committed), as a misleading
+    # "cannot use database" or a ValueError from int(). The version check
+    # accepted `true` and `1.0` (== 1) as well.
+
+    def test_a_bad_value_anywhere_refuses_the_whole_file(self):
+        tmp = mktemp()
+        db = os.path.join(tmp, "x.db")
+        good_run = {"commit": "g", "branch": "main", "created_at": 5,
+                    "report_sha": "gg", "results": [["a::t", "passed", 1, "ok"]]}
+        good_q = {"test_id": "q::good", "reason": "auto", "at": 7}
+        surrogate = "a::t" + chr(0xD800)  # valid in JSON, not in UTF-8
+
+        def doc(run=None, quarantine=None, **top):
+            d = {"flakebox_export": 1,
+                 "runs": [good_run] + ([run] if run is not None else []),
+                 "quarantine": [good_q] + ([quarantine] if quarantine is not None else [])}
+            d.update(top)
+            return d
+
+        def run_with(**fields):
+            r = {"commit": "b", "created_at": 6, "report_sha": "bb",
+                 "results": [["a::t", "passed", 1, "m"]]}
+            r.update(fields)
+            return doc(run=r)
+
+        def row(*cells):
+            return run_with(results=[list(cells)])
+
+        huge = 10 ** 400  # an int no float, and no SQLite INTEGER, can hold
+        cases = [
+            ("duration is an object", row("a::t", "passed", {"x": 1}, "m"),
+             "runs[1].results[0][2] (duration_ms) has the wrong type (dict)"),
+            ("duration is a string", row("a::t", "passed", "12", "m"),
+             "runs[1].results[0][2] (duration_ms) has the wrong type (str)"),
+            ("duration is a bool", row("a::t", "passed", True, "m"),
+             "runs[1].results[0][2] (duration_ms) has the wrong type (bool)"),
+            ("duration is NaN", row("a::t", "passed", float("nan"), "m"),
+             "runs[1].results[0][2] (duration_ms) must be a finite number"),
+            ("duration is Infinity", row("a::t", "passed", float("inf"), "m"),
+             "runs[1].results[0][2] (duration_ms) must be a finite number"),
+            ("duration is 1e300", row("a::t", "passed", 1e300, "m"),
+             "runs[1].results[0][2] (duration_ms) is out of range"),
+            ("duration is 2**63", row("a::t", "passed", 2 ** 63, "m"),
+             "runs[1].results[0][2] (duration_ms) is out of range"),
+            ("duration is a huge int", row("a::t", "passed", huge, "m"),
+             "runs[1].results[0][2] (duration_ms) is out of range"),
+            ("message is a list", row("a::t", "passed", 1, ["x"]),
+             "runs[1].results[0][3] (message) has the wrong type (list)"),
+            ("message is a number", row("a::t", "passed", 1, 5),
+             "runs[1].results[0][3] (message) has the wrong type (int)"),
+            ("test_id is a lone surrogate", row(surrogate, "passed", 1, "m"),
+             "runs[1].results[0][0] (test_id) is not valid text"),
+            ("outcome is an object", row("a::t", {"x": 1}, 1, "m"),
+             "runs[1].results[0] must be [test_id, outcome, duration_ms, message]"),
+            ("commit is a lone surrogate", run_with(commit="c" + chr(0xD800)),
+             "runs[1].commit is not valid text"),
+            ("created_at is NaN", run_with(created_at=float("nan")),
+             "runs[1].created_at must be a finite number"),
+            ("created_at is huge", run_with(created_at=1e300),
+             "runs[1].created_at is out of range"),
+            ("created_at is a string", run_with(created_at="yesterday"),
+             "runs[1].created_at has the wrong type (str)"),
+            ("created_at is a bool", run_with(created_at=True),
+             "runs[1].created_at has the wrong type (bool)"),
+            ("quarantine reason is an object",
+             doc(quarantine={"test_id": "q::x", "reason": {"a": 1}}),
+             "quarantine[1].reason has the wrong type (dict)"),
+            ("quarantine reason is a number",
+             doc(quarantine={"test_id": "q::x", "reason": 5}),
+             "quarantine[1].reason has the wrong type (int)"),
+            ("quarantine at is a string",
+             doc(quarantine={"test_id": "q::x", "at": "yesterday"}),
+             "quarantine[1].at has the wrong type (str)"),
+            ("quarantine at is NaN",
+             doc(quarantine={"test_id": "q::x", "at": float("nan")}),
+             "quarantine[1].at must be a finite number"),
+            ("quarantine at is a bool",
+             doc(quarantine={"test_id": "q::x", "at": True}),
+             "quarantine[1].at has the wrong type (bool)"),
+            ("quarantine at is huge",
+             doc(quarantine={"test_id": "q::x", "at": huge}),
+             "quarantine[1].at is out of range"),
+            ("quarantine test_id is a lone surrogate",
+             doc(quarantine={"test_id": surrogate}),
+             "quarantine[1].test_id is not valid text"),
+            ("version is true", doc(flakebox_export=True), "not a flakebox export"),
+            ("version is 1.0", doc(flakebox_export=1.0), "not a flakebox export"),
+            ("version is a string", doc(flakebox_export="1"), "not a flakebox export"),
+            ("version is 2", doc(flakebox_export=2), "not a flakebox export"),
+        ]
+        for name, document, expect in cases:
+            p = write_raw(tmp, "bad.json", json.dumps(document))
+            code, out, err = run_cli("--db", db, "import", p)
+            self.assertEqual(code, 2, f"{name}: {out}{err}")
+            self.assertIn("cannot import", err, name)
+            self.assertIn(expect, err, name)
+            self.assertNotIn("Traceback", err, name)
+            # nothing was written - not even the valid run and quarantine
+            # entry that come first in the file
+            conn = store_mod.connect(db)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0],
+                             0, name)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM quarantine").fetchone()[0],
+                0, name)
+            conn.close()
+
+    def test_nulls_and_numbers_an_exporter_can_write_still_import(self):
+        tmp = mktemp()
+        p = write_raw(tmp, "ok.json", json.dumps({
+            "flakebox_export": 1,
+            "runs": [{"commit": None, "branch": None, "created_at": 5.7,
+                      "report_sha": None,
+                      "results": [["a::t", "passed", None, None],
+                                  ["a::u", "failed", 1.5, "boom"],
+                                  ["a::v", "skipped", 0, ""]]}],
+            "quarantine": [{"test_id": "q::x", "reason": None, "at": None},
+                           {"test_id": "q::y"},
+                           {"test_id": "q::z", "reason": "auto", "at": 12.5}]}))
+        db = os.path.join(tmp, "h.db")
+        code, out, err = run_cli("--db", db, "import", p)
+        self.assertEqual(code, 0, err)
+        self.assertIn("imported 1 run(s), skipped 0 already recorded, "
+                      "3 new quarantine entries", out)
+        conn = store_mod.connect(db)
+        self.assertEqual(conn.execute("SELECT created_at FROM runs").fetchone()[0], 5)
+        conn.close()
+
+
+class TestImportInputs(unittest.TestCase):
+    """`flakebox import` given a file it cannot use. JSON nested too deeply
+    was a RecursionError traceback, and a directory, or a file that may not
+    be read, an OSError traceback; both ended with exit status 1. Each is
+    now `error: cannot import PATH: why`, one line, exit 2, and nothing is
+    written."""
+
+    DEPTH = 100000      # far deeper than any interpreter's limit
+
+    def setUp(self):
+        self.tmp = mktemp()
+        self.db = os.path.join(self.tmp, "x.db")
+
+    def stored(self) -> tuple:
+        conn = store_mod.connect(self.db)
+        try:
+            return tuple(conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                         for t in ("runs", "results", "quarantine"))
+        finally:
+            conn.close()
+
+    def refused(self, path, *words) -> str:
+        code, out, err = run_cli("--db", self.db, "import", path)
+        self.assertEqual(code, 2, out + err)
+        self.assertEqual(out, "")
+        self.assertEqual(len(err.splitlines()), 1, err)
+        self.assertTrue(err.startswith(f"error: cannot import {path}: "), err)
+        for word in words:
+            self.assertIn(word, err)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(self.stored(), (0, 0, 0))
+        return err
+
+    def nested(self) -> dict:
+        deep = "[" * self.DEPTH + "]" * self.DEPTH
+        return {
+            "array.json": deep,
+            "object.json": '{"a":' * self.DEPTH + "1" + "}" * self.DEPTH,
+            "in_a_run.json": ('{"flakebox_export": 1, "runs": [{"commit": '
+                              + deep + "}]}"),
+        }
+
+    def test_json_nested_too_deeply_is_a_clean_exit_2(self):
+        for name, text in self.nested().items():
+            with self.subTest(name):
+                self.refused(write_raw(self.tmp, name, text),
+                             "nested too deeply")
+
+    def test_a_library_caller_gets_a_value_error_for_it(self):
+        p = write_raw(self.tmp, "deep.json", self.nested()["array.json"])
+        conn = store_mod.connect(self.db)
+        try:
+            with self.assertRaises(ValueError):
+                store_mod.import_file(conn, p)
+        finally:
+            conn.close()
+
+    def test_a_directory_is_a_clean_exit_2(self):
+        d = os.path.join(self.tmp, "adir")
+        os.mkdir(d)
+        self.refused(d)
+
+    def test_a_file_that_cannot_be_opened_is_a_clean_exit_2(self):
+        p = write_raw(self.tmp, "export.json",
+                      '{"flakebox_export": 1, "runs": []}')
+        real_open = open
+
+        def deny(file, *args, **kwargs):
+            if file == p:
+                raise PermissionError(errno.EACCES,
+                                      os.strerror(errno.EACCES), file)
+            return real_open(file, *args, **kwargs)
+
+        with mock.patch("builtins.open", deny):
+            self.refused(p, os.strerror(errno.EACCES))
+
+    @unittest.skipIf(os.name == "nt" or getattr(os, "geteuid", lambda: 1)() == 0,
+                     "read permission is not enforced on Windows (chmod only "
+                     "sets the read-only flag) or against root")
+    def test_a_file_without_read_permission_is_a_clean_exit_2(self):
+        p = write_raw(self.tmp, "export.json",
+                      '{"flakebox_export": 1, "runs": []}')
+        os.chmod(p, 0)
+        try:
+            self.refused(p, os.strerror(errno.EACCES))
+        finally:
+            os.chmod(p, stat.S_IRUSR | stat.S_IWUSR)
+
+    def test_a_missing_file_still_says_so(self):
+        missing = os.path.join(self.tmp, "missing.json")
+        code, _, err = run_cli("--db", self.db, "import", missing)
+        self.assertEqual(code, 2)
+        self.assertEqual(err, f"error: no such file: {missing}\n")
+
+    def test_the_command_line_does_the_same(self):
+        env = child_env()
+        env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
+        deep = write_raw(self.tmp, "deep.json", self.nested()["array.json"])
+        for path in (deep, self.tmp):
+            with self.subTest(path):
+                proc = subprocess.run(
+                    [sys.executable, "-m", "flakebox", "--db", self.db,
+                     "import", path],
+                    capture_output=True, env=env, timeout=60)
+                err = proc.stderr.decode("utf-8", "replace")
+                self.assertEqual(proc.returncode, 2, err)
+                self.assertEqual(len(err.splitlines()), 1, err)
+                self.assertTrue(err.startswith("error: cannot import "), err)
+                self.assertEqual(proc.stdout, b"")
+
+    def test_the_readme_says_these_are_exit_2(self):
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            readme = " ".join(f.read().split())
+        for needle in ("A path that cannot be read (a directory, no "
+                       "permission) and JSON nested too deeply to parse are "
+                       "the same one-line error and exit 2",
+                       "an `export --out` that cannot be written"):
+            self.assertTrue(needle in readme, f"the README does not say {needle}")
+
+    def test_a_good_file_after_a_bad_one_is_not_reached(self):
+        # the first failure ends the run, as it always has
+        good = write_raw(self.tmp, "good.json", json.dumps({
+            "flakebox_export": 1,
+            "runs": [{"commit": "c", "created_at": 5,
+                      "results": [["a::t", "passed", 1, None]]}]}))
+        code, out, err = run_cli("--db", self.db, "import", self.tmp, good)
+        self.assertEqual(code, 2, out)
+        self.assertEqual(self.stored(), (0, 0, 0))
+
+
+class TestExportTarget(unittest.TestCase):
+    """`flakebox export --out DIR` was an IsADirectoryError traceback. An
+    --out that cannot be written is `error: cannot export ...`, exit 2."""
+
+    def refused(self, out_path) -> str:
+        tmp = mktemp()
+        code, out, err = run_cli("--db", os.path.join(tmp, "x.db"),
+                                 "export", "--out", out_path)
+        self.assertEqual(code, 2, out + err)
+        self.assertEqual(out, "")
+        self.assertEqual(len(err.splitlines()), 1, err)
+        self.assertTrue(err.startswith(f"error: cannot export to {out_path}: "),
+                        err)
+        self.assertNotIn("Traceback", err)
+        return err
+
+    def test_a_directory_is_a_clean_exit_2(self):
+        self.refused(mktemp())
+
+    def test_a_folder_that_does_not_exist_is_a_clean_exit_2(self):
+        self.refused(os.path.join(mktemp(), "no", "such", "dir", "x.json"))
+
+    def test_a_file_that_can_be_written_still_is(self):
+        tmp = mktemp()
+        target = os.path.join(tmp, "out.json")
+        code, out, err = run_cli("--db", os.path.join(tmp, "x.db"),
+                                 "export", "--out", target)
+        self.assertEqual(code, 0, err)
+        self.assertIn("exported 0 run(s)", out)
+        with open(target, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["flakebox_export"], 1)
 
 
 class TestLegacyRunFingerprint(unittest.TestCase):
@@ -1891,7 +2974,7 @@ class TestBrokenPipe(unittest.TestCase):
     def test_reader_going_away_end_to_end(self):
         tmp = mktemp()
         db = make_db(tmp)
-        env = dict(os.environ)
+        env = child_env()
         env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
         proc = subprocess.Popen(
             [sys.executable, "-m", "flakebox", "--db", db, "report"],

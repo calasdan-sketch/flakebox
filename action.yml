@@ -86,24 +86,49 @@ runs:
           ${{ inputs.db-key }}-${{ github.job }}-${{ github.ref }}-
           ${{ inputs.db-key }}-${{ github.job }}-refs/heads/main-
 
+    # ------------------------------------------------------------------
+    # NO EXPRESSIONS IN `run:` (shell injection):
+    #
+    # GitHub pastes the value of a ${{ ... }} expression into the script
+    # text BEFORE the shell parses it, so a branch named
+    #   x";touch${IFS}pwned;echo"y
+    # (a legal git ref) closes the quote and runs a command in your job.
+    # Every value a script needs therefore travels in the step's `env:` and
+    # is read as a quoted shell variable ("$FB_BRANCH"): the shell sees a
+    # string, never code. tests/test_flakebox.py scans this file for
+    # `${{` inside a `run:` and runs each script under bash with hostile
+    # values; keep both true when you add a step.
+    #
+    # The two actions/cache steps (restore above, save below) are
+    # first-party and referenced by their major tag (v4), not by a commit
+    # SHA. Pin them to a SHA in a fork if your policy requires it.
+    # ------------------------------------------------------------------
     - name: Install flakebox
       shell: bash
-      run: pip install "${{ github.action_path }}"
+      env:
+        FB_ACTION_PATH: ${{ github.action_path }}
+      run: pip install "$FB_ACTION_PATH"
 
     - name: Record results
       shell: bash
+      env:
+        FB_JUNIT: ${{ inputs.junit }}
+        FB_COMMIT: ${{ github.sha }}
+        FB_BRANCH: ${{ github.ref_name }}
       run: >
         python3 -m flakebox record
-        --junit "${{ inputs.junit }}"
-        --commit "${{ github.sha }}"
-        --branch "${{ github.ref_name }}"
+        --junit "$FB_JUNIT"
+        --commit "$FB_COMMIT"
+        --branch "$FB_BRANCH"
 
     - name: Report
       id: report
       shell: bash
+      env:
+        FB_MIN_RUNS: ${{ inputs.min-runs }}
       run: |
-        python3 -m flakebox report --min-runs "${{ inputs.min-runs }}" >> "$GITHUB_STEP_SUMMARY"
-        N_NEW=$(python3 -m flakebox report --format json --min-runs "${{ inputs.min-runs }}" | python3 -c "
+        python3 -m flakebox report --min-runs "$FB_MIN_RUNS" >> "$GITHUB_STEP_SUMMARY"
+        N_NEW=$(python3 -m flakebox report --format json --min-runs "$FB_MIN_RUNS" | python3 -c "
         import json, sys
         flaky = json.load(sys.stdin)['flaky']
         print(sum(1 for t in flaky if not t['quarantined']))
@@ -116,23 +141,30 @@ runs:
     - name: Quarantine flaky tests (optional)
       if: inputs.quarantine-output != ''
       shell: bash
+      env:
+        FB_MIN_RUNS: ${{ inputs.min-runs }}
+        FB_QUARANTINE_OUTPUT: ${{ inputs.quarantine-output }}
       run: |
-        mkdir -p "$(dirname "${{ inputs.quarantine-output }}")"
-        python3 -m flakebox quarantine --format json --min-runs "${{ inputs.min-runs }}" > "${{ inputs.quarantine-output }}"
-        echo "quarantine set written to ${{ inputs.quarantine-output }}" >> "$GITHUB_STEP_SUMMARY"
+        mkdir -p -- "$(dirname -- "$FB_QUARANTINE_OUTPUT")"
+        python3 -m flakebox quarantine --format json --min-runs "$FB_MIN_RUNS" > "$FB_QUARANTINE_OUTPUT"
+        echo "quarantine set written to $FB_QUARANTINE_OUTPUT" >> "$GITHUB_STEP_SUMMARY"
 
     - name: Export history (optional)
       if: inputs.export-output != ''
       shell: bash
+      env:
+        FB_EXPORT_OUTPUT: ${{ inputs.export-output }}
       run: |
-        mkdir -p "$(dirname "${{ inputs.export-output }}")"
-        python3 -m flakebox export --out "${{ inputs.export-output }}"
+        mkdir -p -- "$(dirname -- "$FB_EXPORT_OUTPUT")"
+        python3 -m flakebox export --out "$FB_EXPORT_OUTPUT"
 
     - name: Fail on new flakes (optional)
       if: inputs.fail-on-flaky == 'true' && steps.report.outputs.new_flaky != '0'
       shell: bash
+      env:
+        FB_NEW_FLAKY: ${{ steps.report.outputs.new_flaky }}
       run: |
-        echo "::error::flakebox detected ${{ steps.report.outputs.new_flaky }} new flaky test(s)"
+        echo "::error::flakebox detected $FB_NEW_FLAKY new flaky test(s)"
         exit 1
 
     - name: Save flakebox history

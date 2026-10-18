@@ -145,11 +145,14 @@ def deselect_args(test_ids: list[str]) -> list[str]:
 
 
 def deselect_line(test_ids: list[str]) -> str:
-    """deselect_args() as one shell line for `pytest $(flakebox quarantine
-    --format deselect)`. Each argument is quoted for the local shell, so
-    a parametrised id with a space or shell characters (`test_x[a b]`,
-    `test_x[$HOME]`) stays one argument: POSIX quoting via shlex, cmd.exe
-    double-quoting on Windows (see the README for PowerShell)."""
+    """deselect_args() as one shell line. Each argument is quoted for the
+    local shell (POSIX quoting via shlex, cmd.exe double-quoting on
+    Windows), so the shell has to parse the line once more -
+    `eval "pytest $(flakebox quarantine --format deselect)"` - to hand
+    pytest an id with a space or shell characters (`test_x[a b]`,
+    `test_x[$HOME]`) as ONE argument. A bare `pytest $(...)` splits the
+    output at whitespace and keeps the quotes, so only ids with neither
+    survive it (the README also covers PowerShell)."""
     args = deselect_args(test_ids)
     if os.name == "nt":
         return subprocess.list2cmdline(args)

@@ -35,8 +35,8 @@ pytest -p flakebox_quarantine        # flakes are skipped, build stays green
 flakebox quarantine --format pytest --mode xfail -o .
 
 # the full quarantine set as shell-quoted pytest --deselect args (best
-# effort, see below) or as JSON for other runners
-pytest $(flakebox quarantine --format deselect)
+# effort, see below; eval parses the quoting) or as JSON for other runners
+eval "pytest $(flakebox quarantine --format deselect)"
 flakebox quarantine --format json
 
 # when a quarantined test stabilizes, the report tells you:
@@ -59,8 +59,12 @@ SQLite database is a clean `error: cannot use database ...`, exit 2.
 same commit twice says `already recorded as run N` and adds nothing
 (`--force` records it anyway), so a retried CI step cannot double-count.
 Nested `<testsuite>` elements (surefire aggregates) are read, `time="0,5"`
-is 500 ms, and a `time` that is not a number is recorded as 0 with a
-warning instead of rejecting the report.
+is 500 ms, and a `time` that is not a finite, non-negative number
+(`fast`, `inf`, `nan`, `-5`, `1e300`) is recorded as 0 with a warning
+instead of rejecting the report. A report that declares a `DOCTYPE` or an
+`ENTITY` is refused (exit 2) as a possible XML bomb, before anything is
+expanded; text that merely mentions `<!DOCTYPE html>`, such as captured
+output in a CDATA section, is fine.
 
 `flakebox quarantine` is idempotent and safe to run on every build: it
 adds the current flaky set (never re-stamping tests already in
@@ -76,12 +80,17 @@ ids, so flakebox maps the common pytest shapes
 `--deselect` that matches nothing. A lowercase class name, a
 `python_files` pattern other than `*.py`, or a non-pytest producer breaks
 the guess; the generated plugin (`--format pytest`) suffix-matches node
-ids instead and is the reliable path. Each argument is quoted for the
-shell, so a parametrised id with a space or shell characters
-(`test_param[a b]`) survives `pytest $(...)` as one argument; on
-Windows the line is quoted for `cmd.exe`. PowerShell has no `$(...)`
-word splitting — use `Invoke-Expression "pytest $(flakebox quarantine
---format deselect)"`, or the plugin.
+ids instead and is the reliable path. The line quotes each argument for
+the shell (POSIX quoting; `cmd.exe` quoting on Windows), so the shell
+has to parse it once more: `eval "pytest $(flakebox quarantine --format
+deselect)"` hands pytest every id as one argument, even
+`test_param[a b]` or one containing `$(...)`. A bare `pytest
+$(flakebox quarantine --format deselect)` does not: command
+substitution splits the output at whitespace and never removes the
+quotes in it, so an id with a space or a shell character arrives in
+pieces with the quotes still attached (ids without either are fine).
+PowerShell has no `$(...)` word splitting — use `Invoke-Expression
+"pytest $(flakebox quarantine --format deselect)"`, or the plugin.
 
 Parametrised ids are matched whole by the plugin: quarantining
 `test_version[1.5]` skips exactly that case, never `test_unrelated[0.5]`
@@ -109,7 +118,9 @@ Example report:
 
 No ML, fully explainable. Only *executed* runs count — a skipped run is
 not evidence either way, so it never pushes a test over `--min-runs` and
-never breaks a pass streak.
+never breaks a pass streak. "Newest" always means the newest recorded
+time of a run (its row id only breaks a tie), so merging an older export
+into a DB never makes old runs look recent.
 
 - **flaky**: at least one pass *and* at least one failure (`failed` or
   `error`) across ≥5 executed runs (`--min-runs`), and not currently on
@@ -163,10 +174,19 @@ DB it came from, adds nothing; quarantine entries merge as a set. Runs
 recorded without a report hash (flakebox < 0.3, or through the Python
 API) carry a content **fingerprint** (`legacy:` + a digest of commit,
 timestamp and results) instead, stamped when the DB is opened, so they
-are recognised too. A malformed export is refused as a whole before
-anything is written (`error: cannot import ...: runs[0] must be an
-object`, exit 2). This is how CI's history reaches a laptop, and how
-per-job DBs of a matrix build become one (see the Action).
+are recognised too. Imported runs keep their original timestamp, and
+the newest-runs windows (the pass streak, `--retire-after`, `history`)
+follow timestamps, not the order rows were added; a run exported
+without a timestamp is imported as the oldest. A malformed export is
+refused as a whole before anything is written: every field is checked
+first (types, finite numbers that fit a 64-bit integer, text UTF-8 can
+encode, `"flakebox_export": 1` exactly) and the error names the first bad
+one (`error: cannot import ...: runs[0] must be an object`, exit 2).
+A path that cannot be read (a directory, no permission) and JSON nested
+too deeply to parse are the same one-line error and exit 2, and so is an
+`export --out` that cannot be written.
+This is how CI's history reaches a laptop, and how per-job DBs of a
+matrix build become one (see the Action).
 
 ## GitHub Action
 
@@ -225,10 +245,34 @@ exists. Matrix builds: see the cache-race note at the top of `action.yml`
 (per-job DBs, then an aggregator job that `flakebox import`s every job's
 export).
 
+**No expression ever reaches a shell.** GitHub pastes the value of a
+`${{ ... }}` expression into a `run:` script *before* bash parses it, so a
+branch named `x";touch${IFS}pwned;echo"y` (a legal git ref) would run a
+command in your job. The action passes every input and `github.*` value
+through the step's `env:` and reads it as a quoted variable
+(`"$FB_BRANCH"`), so the shell only ever sees a string. The test suite
+scans `action.yml` for `${{` inside any `run:` and runs each script under
+bash with hostile values. The two `actions/cache` steps are first-party
+and use the `v4` tag, not a commit SHA; pin them in a fork if your policy
+requires it.
+
+## Limitations
+
+- **Recency is wall-clock time.** "Newest" is when a run was recorded
+  (an imported run keeps the time it was exported with); runs recorded in
+  the same second tie and fall back to the order they were added, and
+  machines whose clocks disagree order their merged runs by those clocks.
+- **`--format deselect` is a guess** at pytest node ids (see above); the
+  generated plugin is the reliable path, and `eval` is needed for ids with
+  a space or a shell character.
+- **Any DOCTYPE is refused**, harmless or not: JUnit reports never need
+  one, and refusing them all keeps the XML-bomb check simple.
+- **The Action's cache steps use the `v4` tag**, not a commit SHA (above).
+
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests   # 90 tests, no network, stdlib only
+python3 -m unittest discover -s tests   # no network, stdlib only
 python3 -m pytest -q                    # same suite
 ```
 

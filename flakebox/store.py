@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import time
@@ -128,22 +129,33 @@ def record_run(conn: sqlite3.Connection, results: list[dict],
     return run_id
 
 
+# Recency. "Newest" means the newest `created_at`, and the row id only
+# breaks a tie: `flakebox import` appends rows, so an older export imported
+# after newer local runs gets the HIGHER ids, and ordering by id would make
+# its old runs look like the latest (a test that ran in every recent run
+# reported retired, a recovered one flaky). A run without a timestamp
+# (NULL) sorts as the oldest.
+NEWEST_FIRST = "runs.created_at DESC, runs.id DESC"
+
+
 def test_history(conn: sqlite3.Connection, test_id: str,
                  limit: int = 50) -> list[dict]:
+    """One test's results, newest run first (see NEWEST_FIRST)."""
     cur = conn.cursor()
     cur.execute(
         "SELECT r.outcome, r.duration_ms, runs.commit_sha, runs.created_at"
         " FROM results r JOIN runs ON r.run_id = runs.id"
-        " WHERE r.test_id = ? ORDER BY runs.id DESC LIMIT ?",
+        f" WHERE r.test_id = ? ORDER BY {NEWEST_FIRST} LIMIT ?",
         (test_id, limit))
     return [{"outcome": o, "duration_ms": d, "commit": c, "at": t}
             for o, d, c, t in cur.fetchall()]
 
 
 def recent_run_ids(conn: sqlite3.Connection, n: int) -> list[int]:
-    """Ids of the newest `n` recorded runs (newest first)."""
-    cur = conn.execute("SELECT id FROM runs ORDER BY id DESC LIMIT ?",
-                       (max(int(n), 0),))
+    """Ids of the newest `n` recorded runs (newest first, see
+    NEWEST_FIRST)."""
+    cur = conn.execute(f"SELECT id FROM runs ORDER BY {NEWEST_FIRST} "
+                       f"LIMIT ?", (max(int(n), 0),))
     return [row[0] for row in cur.fetchall()]
 
 
@@ -221,18 +233,46 @@ def export_file(conn: sqlite3.Connection, path: str) -> dict:
     return data
 
 
-def _optional(value, types, where: str):
-    if value is not None and not isinstance(value, types):
+_INT64 = 2 ** 63  # SQLite INTEGER: -_INT64 <= n < _INT64
+
+
+def _text(value, where: str, optional: bool = True) -> None:
+    """`value` must be a str (or None, if optional) that UTF-8 can encode:
+    JSON allows a lone surrogate, which SQLite cannot store."""
+    if value is None and optional:
+        return
+    if not isinstance(value, str):
         raise ValueError(f"export: {where} has the wrong type "
                          f"({type(value).__name__})")
-    return value
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(f"export: {where} is not valid text "
+                         f"(a lone surrogate)") from None
+
+
+def _number(value, where: str) -> None:
+    """`value` must be None or a finite int / float (never a bool) that an
+    SQLite INTEGER can hold once truncated: NaN, Infinity and 1e300 are
+    valid JSON to Python's parser and used to fail halfway through."""
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"export: {where} has the wrong type "
+                         f"({type(value).__name__})")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"export: {where} must be a finite number")
+    if not -_INT64 <= int(value) < _INT64:
+        raise ValueError(f"export: {where} is out of range")
 
 
 def validate_export(data) -> dict:
-    """Check the shape of an export document before anything is written;
+    """Check every field of an export document before anything is written;
     a malformed file is a ValueError naming the first bad field, never a
-    traceback halfway through an import. Returns the data."""
-    if not isinstance(data, dict) or data.get("flakebox_export") != EXPORT_FORMAT:
+    traceback (or a half-finished import) later. Returns the data."""
+    if (not isinstance(data, dict)
+            or type(data.get("flakebox_export")) is not int
+            or data["flakebox_export"] != EXPORT_FORMAT):
         raise ValueError("not a flakebox export "
                          f"(expected \"flakebox_export\": {EXPORT_FORMAT})")
     runs = data.get("runs")
@@ -243,22 +283,25 @@ def validate_export(data) -> dict:
     for i, run in enumerate(runs):
         if not isinstance(run, dict):
             raise ValueError(f"export: runs[{i}] must be an object")
-        _optional(run.get("commit"), str, f"runs[{i}].commit")
-        _optional(run.get("branch"), str, f"runs[{i}].branch")
-        _optional(run.get("report_sha"), str, f"runs[{i}].report_sha")
-        _optional(run.get("created_at"), (int, float), f"runs[{i}].created_at")
-        if isinstance(run.get("created_at"), bool):
-            raise ValueError(f"export: runs[{i}].created_at has the wrong type")
+        _text(run.get("commit"), f"runs[{i}].commit")
+        _text(run.get("branch"), f"runs[{i}].branch")
+        _text(run.get("report_sha"), f"runs[{i}].report_sha")
+        _number(run.get("created_at"), f"runs[{i}].created_at")
         results = run.get("results")
         if results is None:
             results = run["results"] = []
         if not isinstance(results, list):
             raise ValueError(f"export: runs[{i}].results must be a list")
         for j, row in enumerate(results):
+            where = f"runs[{i}].results[{j}]"
             if (not isinstance(row, (list, tuple)) or len(row) != 4
                     or not isinstance(row[0], str) or not isinstance(row[1], str)):
-                raise ValueError(f"export: runs[{i}].results[{j}] must be "
+                raise ValueError(f"export: {where} must be "
                                  f"[test_id, outcome, duration_ms, message]")
+            _text(row[0], f"{where}[0] (test_id)", optional=False)
+            _text(row[1], f"{where}[1] (outcome)", optional=False)
+            _number(row[2], f"{where}[2] (duration_ms)")
+            _text(row[3], f"{where}[3] (message)")
     quarantine = data.get("quarantine")
     if quarantine is None:
         quarantine = data["quarantine"] = []
@@ -268,6 +311,9 @@ def validate_export(data) -> dict:
         if not isinstance(q, dict) or not isinstance(q.get("test_id"), str):
             raise ValueError(f"export: quarantine[{i}] must be an object "
                              f"with a test_id")
+        _text(q["test_id"], f"quarantine[{i}].test_id", optional=False)
+        _text(q.get("reason"), f"quarantine[{i}].reason")
+        _number(q.get("at"), f"quarantine[{i}].at")
     return data
 
 
@@ -276,8 +322,11 @@ def import_data(conn: sqlite3.Connection, data: dict) -> dict:
     same report (commit + report_sha) is already here, so importing the
     same file twice, or importing into the DB it came from, adds nothing.
     A run exported without a report_sha (recorded by flakebox < 0.3) is
-    recognised by its content fingerprint instead. Quarantine entries
-    merge as a set. Returns counts."""
+    recognised by its content fingerprint instead. Every run keeps the
+    `created_at` it was exported with - that, not the order of arrival,
+    decides which runs are the newest - and a run exported without one is
+    imported as the oldest (0). Quarantine entries merge as a set. Returns
+    counts."""
     validate_export(data)
     added = skipped = 0
     for run in sorted(data["runs"], key=lambda r: (r.get("created_at") or 0)):
@@ -291,7 +340,7 @@ def import_data(conn: sqlite3.Connection, data: dict) -> dict:
         results = [{"test_id": t, "outcome": o, "duration_ms": d, "message": m}
                    for t, o, d, m in rows]
         record_run(conn, results, run.get("commit"), run.get("branch"),
-                   report_sha=sha, created_at=at)
+                   report_sha=sha, created_at=0 if at is None else at)
         added += 1
     q_added = 0
     for q in data["quarantine"]:
@@ -303,6 +352,12 @@ def import_data(conn: sqlite3.Connection, data: dict) -> dict:
 
 
 def import_file(conn: sqlite3.Connection, path: str) -> dict:
+    """Merge the export in `path` into the DB. Raises OSError if the file
+    cannot be read, ValueError if it is not a usable export (JSON nested
+    deeper than the parser can follow included)."""
     with open(path, encoding="utf-8") as f:
-        data = json.load(f)
+        try:
+            data = json.load(f)
+        except RecursionError:
+            raise ValueError("nested too deeply") from None
     return import_data(conn, data)

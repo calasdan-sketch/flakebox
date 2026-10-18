@@ -19,6 +19,9 @@ Definitions (skipped runs never count as evidence either way):
             and otherwise left out, so a test removed from the suite
             does not stay "consistently failing" for fifty more builds.
 
+"Newest" is by the run's ``created_at`` (the row id only breaks a tie), so
+importing an older export after newer local runs changes no verdict.
+
 classify() is the one place these words are decided; report, history
 and the JSON output all go through it.
 """
@@ -99,45 +102,48 @@ def analyze(conn, min_runs: int = 5, stable_runs: int = STABLE_RUNS,
     ranked lists.
 
     Single batched query (the most recent `window` runs per test, via
-    ROW_NUMBER), then the counts from stats() in Python - no per-test
-    N+1 history fetches. Iteration order is first appearance in the
-    results table, which is the order of the unsorted `stable` list.
-    Tests absent from the newest `retire_after` runs go to `retired`
-    (with where they were last seen) and nowhere else.
+    ROW_NUMBER over (created_at, id) - see store.NEWEST_FIRST), then the
+    counts from stats() in Python - no per-test N+1 history fetches.
+    Iteration order is first appearance in the results table, which is the
+    order of the unsorted `stable` list. Tests absent from the newest
+    `retire_after` runs go to `retired` (with where they were last seen)
+    and nowhere else.
     """
     cur = conn.cursor()
     cur.execute(
-        "SELECT test_id, outcome, first_seen, last_run FROM ("
+        "SELECT test_id, outcome, run_id, created_at, first_seen FROM ("
         "  SELECT r.test_id AS test_id, r.outcome AS outcome,"
-        "         r.run_id AS run_id,"
+        "         r.run_id AS run_id, runs.created_at AS created_at,"
         "         ROW_NUMBER() OVER (PARTITION BY r.test_id"
-        "                            ORDER BY r.run_id DESC) AS rn,"
-        "         MIN(r.rowid) OVER (PARTITION BY r.test_id) AS first_seen,"
-        "         MAX(r.run_id) OVER (PARTITION BY r.test_id) AS last_run"
-        "  FROM results r"
-        ") WHERE rn <= ? ORDER BY test_id, run_id DESC",
+        f"                            ORDER BY {store_mod.NEWEST_FIRST}"
+        "                           ) AS rn,"
+        "         MIN(r.rowid) OVER (PARTITION BY r.test_id) AS first_seen"
+        "  FROM results r JOIN runs ON r.run_id = runs.id"
+        ") WHERE rn <= ? ORDER BY test_id, rn",
         (window,))
-    # outcomes per test, newest-run first (rn 1..window)
-    by_test: dict[str, tuple[list[str], int, int]] = {}
-    for test_id, outcome, first_seen, last_run in cur.fetchall():
+    # outcomes per test, newest-run first (rn 1..window); the first row of
+    # a test is its newest run
+    by_test: dict[str, tuple[list[str], int, int, int | None]] = {}
+    for test_id, outcome, run_id, at, first_seen in cur.fetchall():
         if test_id in by_test:
             by_test[test_id][0].append(outcome)
         else:
-            by_test[test_id] = ([outcome], first_seen, last_run)
+            by_test[test_id] = ([outcome], first_seen, run_id, at)
     qcur = conn.cursor()
     qcur.execute("SELECT test_id FROM quarantine")
     quarantined_ids = {row[0] for row in qcur.fetchall()}
-    recent = store_mod.recent_run_ids(conn, retire_after)
-    horizon = min(recent) if recent else 0  # oldest run that still counts
+    recent = set(store_mod.recent_run_ids(conn, retire_after))
     flaky, broken, stable, retired = [], [], [], []
-    for test_id, (outcomes, _first_seen, last_run) in sorted(
+    last_seen_at: dict[str, int | None] = {}
+    for test_id, (outcomes, _first_seen, last_run, last_at) in sorted(
             by_test.items(), key=lambda kv: kv[1][1]):
         s = stats(outcomes, stable_runs)
         s["test_id"] = test_id
         s["quarantined"] = test_id in quarantined_ids
-        if last_run < horizon:
+        if recent and last_run not in recent:  # none of its runs is recent
             s["retired"] = True
             s["last_run"] = last_run
+            last_seen_at[test_id] = last_at
             retired.append(s)
             continue
         s["retired"] = False
@@ -151,7 +157,10 @@ def analyze(conn, min_runs: int = 5, stable_runs: int = STABLE_RUNS,
             stable.append(s)
     flaky.sort(key=lambda s: (-s["flake_rate"], -s["failures"]))
     broken.sort(key=lambda s: -s["failures"])
-    retired.sort(key=lambda s: (-s["last_run"], s["test_id"]))
+    never = float("-inf")  # a run without a timestamp is the oldest
+    retired.sort(key=lambda s: (
+        -(never if last_seen_at[s["test_id"]] is None
+          else last_seen_at[s["test_id"]]), -s["last_run"], s["test_id"]))
     if retired:
         commits = dict(conn.execute(
             "SELECT id, commit_sha FROM runs WHERE id IN (%s)"
