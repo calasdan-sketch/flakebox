@@ -13,7 +13,9 @@ its own: the build is green, the test is not trustworthy.
 Everything printed is deterministic: the same report and history give the
 same text. Test names and messages come from the report, so they only ever
 appear inside a code span (one fence longer than any backtick run in them),
-cut to one line, with the @ of a mention broken.
+cut to one line. Markdown does not link a mention, tag or URL inside a code
+span, and the text stays exactly what the id is, so it can be copied into
+`flakebox retriage --test`.
 """
 
 from __future__ import annotations
@@ -121,14 +123,14 @@ def md_code(text: str) -> str:
 def _message(text: str) -> str:
     text = re.sub(r"\s+", " ", text or "").strip()
     if len(text) > MAX_MESSAGE:
-        text = text[:MAX_MESSAGE - 1] + "…"
-    return text.replace("@", "@​")
+        text = text[:MAX_MESSAGE - 3] + "..."
+    return text
 
 
 def _listing(rows: list[dict], with_rate: bool) -> list[str]:
     out = []
     for r in rows[:MAX_LISTED]:
-        bits = [md_code(r["test_id"].replace("@", "@​"))]
+        bits = [md_code(r["test_id"])]
         if with_rate and r["flake_rate"] is not None:
             bits.append(f"flaky {r['flake_rate']:.0%} of its runs")
         if r["quarantined"]:
@@ -165,7 +167,7 @@ def to_markdown(c: dict, est: dict | None = None, expired=None,
     if expired:
         lines += ["", f"### Quarantine older than {expired_days} day(s)"]
         for e in expired[:MAX_LISTED]:
-            lines.append(f"- {md_code(e['test_id'].replace('@', '@' + chr(0x200b)))}"
+            lines.append(f"- {md_code(e['test_id'])}"
                          f", {e['days']} day(s)")
         lines.append("Look at each and run `flakebox retriage --test ID` to "
                      "keep it, or `flakebox unquarantine --test ID` to "

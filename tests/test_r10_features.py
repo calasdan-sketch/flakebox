@@ -316,6 +316,14 @@ class TestSummaryCommand(Tmp):
         self.assertNotIn("](", outside)
         self.assertNotRegex(text, r"(?m)^## Flakebox: ok")
 
+    def test_a_long_message_is_cut_in_plain_ascii(self):
+        c = {"known": [], "broken": [], "retried": [], "failed": 1, "tests": 1,
+             "new": [dict(row("t::x", "failed", message="m" * 500),
+                          flake_rate=None, quarantined=False)]}
+        text = summary_mod.to_markdown(c)
+        self.assertIn("m" * 117 + "...", text)
+        text.encode("ascii")
+
     def test_md_code_fences(self):
         self.assertEqual(summary_mod.md_code("a"), "`a`")
         self.assertEqual(summary_mod.md_code("a`b"), "``a`b``")
