@@ -9,9 +9,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # all history and branches: the next step needs origin/main
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # A tag can be pushed from any branch. Only a commit that is already on
+      # main may be published.
+      - name: The tagged commit must be on main
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          git fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main"
+          if ! git merge-base --is-ancestor "$RELEASE_SHA" origin/main; then
+            echo "::error::the tagged commit $RELEASE_SHA is not on origin/main; merge it first"
+            exit 1
+          fi
       - name: Tag must equal the package version
         env:
           TAG: ${{ github.ref_name }}

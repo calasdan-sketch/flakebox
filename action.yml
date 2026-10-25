@@ -114,15 +114,30 @@ runs:
     # first-party and referenced by their major tag (v4), not by a commit
     # SHA. Pin them to a SHA in a fork if your policy requires it.
     # ------------------------------------------------------------------
-    - name: Install flakebox
+    # ------------------------------------------------------------------
+    # NO pip: flakebox is stdlib-only, so the action runs the copy of the
+    # package that sits in the action's own checkout (PYTHONPATH on each
+    # step, never exported to the rest of the job). `pip install` into the
+    # runner's system Python fails on a distribution-managed Python
+    # ("externally-managed-environment", PEP 668) and a venv needs a package
+    # some images lack; running from the checkout needs neither and cannot
+    # leave a stale install behind. The first step fails with one clear line
+    # if python3 is missing or too old.
+    # ------------------------------------------------------------------
+    - name: Check flakebox runs
       shell: bash
       env:
-        FB_ACTION_PATH: ${{ github.action_path }}
-      run: python3 -m pip install "$FB_ACTION_PATH"
+        PYTHONPATH: ${{ github.action_path }}
+      run: |
+        if ! python3 -m flakebox --version; then
+          echo "::error::flakebox needs Python 3.10 or newer as python3 on the runner (add actions/setup-python before this step)"
+          exit 1
+        fi
 
     - name: Record results
       shell: bash
       env:
+        PYTHONPATH: ${{ github.action_path }}
         FB_JUNIT: ${{ inputs.junit }}
         FB_COMMIT: ${{ github.sha }}
         FB_BRANCH: ${{ github.ref_name }}
@@ -136,6 +151,7 @@ runs:
       id: report
       shell: bash
       env:
+        PYTHONPATH: ${{ github.action_path }}
         FB_MIN_RUNS: ${{ inputs.min-runs }}
       run: |
         python3 -m flakebox report --min-runs="$FB_MIN_RUNS" >> "$GITHUB_STEP_SUMMARY"
@@ -153,6 +169,7 @@ runs:
       if: inputs.quarantine-output != ''
       shell: bash
       env:
+        PYTHONPATH: ${{ github.action_path }}
         FB_MIN_RUNS: ${{ inputs.min-runs }}
         FB_QUARANTINE_OUTPUT: ${{ inputs.quarantine-output }}
       run: |
@@ -164,6 +181,7 @@ runs:
       if: inputs.export-output != ''
       shell: bash
       env:
+        PYTHONPATH: ${{ github.action_path }}
         FB_EXPORT_OUTPUT: ${{ inputs.export-output }}
       run: |
         mkdir -p -- "$(dirname -- "$FB_EXPORT_OUTPUT")"

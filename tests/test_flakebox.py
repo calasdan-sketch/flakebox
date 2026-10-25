@@ -625,7 +625,9 @@ class TestActionShellInjection(unittest.TestCase):
         carriers = 0
         for s in self.run_steps():
             # the env entries that carry an expression into the script
-            names = {k for k, v in s["env"].items() if "${{" in v}
+            # PYTHONPATH is read by python itself, not by the script
+            names = {k for k, v in s["env"].items()
+                     if "${{" in v and k != "PYTHONPATH"}
             carriers += len(names)
             for name in names:
                 self.assertRegex(s["run"], r"\$\{?" + name + r"\b",
@@ -694,7 +696,7 @@ class TestActionShellInjection(unittest.TestCase):
                 calls = [json.loads(ln) for ln in f.read().splitlines()]
             # every hostile string arrived as exactly one argument
             self.assertEqual(calls, [
-                ["python3", "-m", "pip", "install", value],
+                ["python3", "-m", "flakebox", "--version"],
                 ["python3", "-m", "flakebox", "record", f"--junit={value}",
                  f"--commit={value}", f"--branch={value}"],
                 ["python3", "-m", "flakebox", "report", f"--min-runs={value}"],
@@ -779,7 +781,8 @@ class TestActionOptionValues(unittest.TestCase):
         os.chmod(os.path.join(shims, "python3"), 0o755)
         write_raw(work, "-report.xml", JUNIT)
         context = {"inputs.junit": "-report.xml", "github.sha": "-c0ffee",
-                   "github.ref_name": "-x", "inputs.export-output": "-out.json"}
+                   "github.ref_name": "-x", "inputs.export-output": "-out.json",
+                   "github.action_path": REPO}
         steps = {s["name"]: s for s in action_steps(action_text())}
 
         def run(name: str):
@@ -1543,7 +1546,8 @@ def reference_analyze(conn, min_runs=5, stable_runs=10, window=50,
             continue
         last_run = seen[0][1]
         outcomes = [o for _, _, o in seen]
-        passes = sum(1 for o in outcomes if o == "passed")
+        retries = sum(1 for o in outcomes if o == "retried")
+        passes = sum(1 for o in outcomes if o in ("passed", "retried"))
         fails = sum(1 for o in outcomes if o in ("failed", "error"))
         skips = sum(1 for o in outcomes if o == "skipped")
         streak = 0
@@ -1553,11 +1557,13 @@ def reference_analyze(conn, min_runs=5, stable_runs=10, window=50,
             elif o != "skipped":
                 break
         executed = passes + fails
-        status = ("flaky" if passes and fails else "failing" if fails
+        status = ("flaky" if (passes and fails) or retries
+                  else "failing" if fails
                   else "passing" if passes else "unknown")
         s = {"runs": executed, "recorded": len(outcomes), "passes": passes,
              "failures": fails, "skips": skips,
-             "flake_rate": (fails / executed) if executed else 0.0,
+             "retries": retries,
+             "flake_rate": ((fails + retries) / executed) if executed else 0.0,
              "pass_streak": streak, "status": status, "test_id": tid,
              "quarantined": store_mod.is_quarantined(conn, tid)}
         if recent and last_run not in recent:
@@ -1568,7 +1574,7 @@ def reference_analyze(conn, min_runs=5, stable_runs=10, window=50,
             retired.append(s)
             continue
         s["retired"] = False
-        if executed < min_runs:
+        if executed < min_runs and not retries:
             continue
         recovered = streak >= stable_runs
         if status == "flaky" and not recovered:
@@ -4132,8 +4138,11 @@ class TestRound9(unittest.TestCase):
             '<testcase classname="a.B" name="u"/>'])
         res = junit_mod.parse_bytes(raw)
         self.assertEqual([r["test_id"] for r in res], ["a.B::t", "a.B::u"])
-        self.assertEqual(res[0]["outcome"], "failed")
+        # fail, then pass again: the last attempt passed, so the build is
+        # green and the test flaked -- recorded as a retry-pass
+        self.assertEqual(res[0]["outcome"], "retried")
         self.assertEqual(res[0]["message"], "x")
+        self.assertEqual(res[0]["duration_ms"], 2000)
 
     def test_duplicate_error_beats_failure_and_skip_loses_to_pass(self):
         raw = self.junit([
@@ -4178,8 +4187,10 @@ class TestRound9(unittest.TestCase):
 
     def test_action_installs_with_the_interpreter_it_runs_and_save_key_has_attempt(self):
         text = action_text()
-        self.assertIn('python3 -m pip install "$FB_ACTION_PATH"', text)
-        self.assertNotRegex(text, r"(?m)run:\s+pip install")
+        # no pip at all (PEP 668 systems refuse it): the action runs the
+        # package from its own checkout, PYTHONPATH set per step
+        self.assertNotIn("pip install", text.replace("`pip install`", ""))
+        self.assertNotIn("-m pip", text)
         save = text[text.index("Save flakebox history"):]
         self.assertIn("github.run_attempt", save)
 

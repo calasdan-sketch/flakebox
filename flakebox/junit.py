@@ -11,8 +11,13 @@ from .quarantine import REASON as QUARANTINE_REASON
 
 # outcome per testcase
 PASSED, FAILED, ERROR, SKIPPED = "passed", "failed", "error", "skipped"
+# One report holds a failed attempt of a test and a later passed one (a retry
+# plugin): the build is green, the test is flaky. Recorded as its own outcome
+# so the history keeps the evidence (see detect.py).
+RETRIED = "retried"
 
-# worst outcome wins when one report repeats a test
+# worst outcome wins when one report repeats a test (unless the last attempt
+# passed after a failed one: RETRIED, see _merge)
 _SEVERITY = {SKIPPED: 0, PASSED: 1, FAILED: 2, ERROR: 3}
 
 MAX_MS = 2 ** 63 - 1  # the largest duration an SQLite INTEGER can hold
@@ -106,6 +111,7 @@ def parse_bytes(raw: bytes, path: str = "", warn=_warn) -> list[dict]:
     root = ET.fromstring(raw)
     results = []
     seen: dict[str, dict] = {}
+    attempts: dict[str, list[str]] = {}
     cases = [root] if root.tag == "testcase" else root.iter("testcase")
     for tc in cases:
         tid = test_id(tc.get("classname", ""), tc.get("name", ""))
@@ -133,14 +139,31 @@ def parse_bytes(raw: bytes, path: str = "", warn=_warn) -> list[dict]:
         # parametrised id that collapses) is ONE run of that test: the
         # worst outcome wins, so one report never counts as two runs
         prev = seen.get(tid)
+        attempts.setdefault(tid, []).append(outcome)
         if prev is None:
             seen[tid] = row
             results.append(row)
         elif _SEVERITY[outcome] > _SEVERITY[prev["outcome"]]:
+            longest = max(prev["duration_ms"], ms)
             prev.update(row)
+            prev["duration_ms"] = longest
         else:
             prev["duration_ms"] = max(prev["duration_ms"], ms)
+    for tid, row in seen.items():
+        if is_retry_pass(attempts[tid]):
+            row["outcome"] = RETRIED  # keeps the failure's message
     return results
+
+
+def is_retry_pass(attempts: list[str]) -> bool:
+    """A test repeated in one report is a retry-pass when an attempt failed
+    or errored and a LATER attempt passed, and the last attempt that ran
+    passed: the build is green and the test flaked. Skipped attempts are
+    ignored. A pass followed by a failure is a failure (the last word)."""
+    ran = [a for a in attempts if a != SKIPPED]
+    if not ran or ran[-1] != PASSED:
+        return False
+    return any(a in (FAILED, ERROR) for a in ran[:-1])
 
 
 def read(path: str) -> bytes:

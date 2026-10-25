@@ -28,7 +28,7 @@ from . import junit as junit_mod
 from . import quarantine as quar_mod
 from . import store as store_mod
 
-VERSION = "0.4.5"
+VERSION = "0.4.6"
 
 
 def default_db() -> str:
@@ -143,8 +143,10 @@ def cmd_record(args) -> int:
     finally:
         conn.close()
     n_fail = sum(1 for r in results if r["outcome"] in ("failed", "error"))
+    n_retry = sum(1 for r in results if r["outcome"] == junit_mod.RETRIED)
+    extra = f", {n_retry} passed on retry" if n_retry else ""
     print(f"recorded run {run_id}: {len(results)} tests, "
-          f"{n_fail} failed/error")
+          f"{n_fail} failed/error{extra}")
     return 0
 
 
@@ -171,6 +173,12 @@ def cmd_report(args) -> int:
             q = " \U0001f512" if s["quarantined"] else ""
             print(f"| `{s['test_id']}` | {_pct(s['flake_rate'])} | "
                   f"{s['failures']}/{s['passes']} | {s['runs']} |{q}")
+        retried = [s for s in a["flaky"] if s["retries"]]
+        if retried:
+            print("Passed on retry inside one report (failed, then passed "
+                  "on the same commit):")
+            for s in retried:
+                print(f"- `{s['test_id']}`: {s['retries']} run(s)")
         print()
     else:
         print("No flaky tests detected. \U0001f389\n")

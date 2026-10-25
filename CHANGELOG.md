@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.6
+
+- A test that fails and then passes inside one JUnit report (a retry plugin) is now recorded as a flake ("retried"), not hidden behind the worst outcome. `flakebox report` lists it ("Passed on retry"), `flakebox history` calls it flaky, and one such run is enough (it does not wait for `--min-runs`). A pass followed by a failure is still a failure. A duplicated test keeps its longest duration.
+- The GitHub Action no longer runs `pip install`: it runs the package from its own checkout, so it works on a system Python that refuses pip installs (PEP 668).
+- CI installs pytest (ten plugin tests skipped without it), smoke-tests the installed `flakebox` command on Linux, Windows and macOS, and runs the unpacked sdist's own tests.
+- The release workflow refuses a tag whose commit is not on `origin/main`.
+
 ## 0.4.5
 
 - `--min-runs` must now be 1 or more; `0` or a negative number is rejected with exit code 2.

@@ -184,6 +184,14 @@ into a DB never makes old runs look recent.
   says `recovered (18 consecutive passes)`: one `classify()` decides the
   word for every command, and `history` takes the same `--min-runs`,
   `--stable-runs` and `--retire-after` flags as `report`.
+- **retry-pass**: one report holds a failed attempt of a test and a later
+  passed one (a retry plugin such as pytest-rerunfailures). The build is
+  green but the test flaked on that very commit, so flakebox records it as
+  `retried`, not as a plain pass: one such run makes the test **flaky**
+  without waiting for `--min-runs`, it breaks a pass streak, and the flake
+  rate counts the failed attempt. `flakebox report` lists these tests under
+  "Passed on retry". A pass followed by a failure in the same report is a
+  failure, and the longest duration of the repeats is kept.
 - **failing** (the "Consistently failing" section): ≥5 executed runs and
   never a pass. Broken, not flaky — different problem, don't quarantine
   it. `flakebox history` labels it `failing` and shows no flake rate.

@@ -1,2 +1,3 @@
 include action.yml
 include CHANGELOG.md
+recursive-include tests *.py

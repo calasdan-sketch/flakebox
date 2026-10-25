@@ -5,7 +5,12 @@ Definitions (skipped runs never count as evidence either way):
 - executed runs = passes + failures (``failed`` and ``error`` both fail)
 - FLAKY   = at least one pass AND at least one failure across the window,
             over at least ``min_runs`` executed runs, and not currently on
-            a pass streak of ``stable_runs``.
+            a pass streak of ``stable_runs``. Also FLAKY, whatever
+            ``min_runs`` says: a run in which one report holds a failed
+            attempt and a later passed one (``retried``, a retry-pass): the
+            test failed and passed on the same commit, which is the
+            definition. It counts as a pass of the run, breaks a pass streak
+            and counts as a failed attempt in the flake rate.
 - RECOVERED = would be flaky, but the newest ``stable_runs`` executed
             runs all passed: it has recovered and is left alone (not
             re-quarantined); ``report`` and ``history`` both say so.
@@ -33,17 +38,18 @@ from . import store as store_mod
 FLAKY, FAILING, PASSING, UNKNOWN = "flaky", "failing", "passing", "unknown"
 RECOVERED = "recovered"
 FAIL_OUTCOMES = ("failed", "error")
+RETRIED = "retried"  # failed, then passed on retry inside one report
 RETIRE_AFTER = 3  # absent from this many newest runs -> retired
 STABLE_RUNS = 10  # consecutive newest passes that make a test stable
 
 
 def classify(passes: int, failures: int, pass_streak: int = 0,
-             stable_runs: int = 0) -> str:
+             stable_runs: int = 0, retries: int = 0) -> str:
     """The status word for a test's executed runs (no min-runs
     threshold). With `stable_runs` > 0, a pass-and-fail history whose
     newest `stable_runs` executed runs all passed is RECOVERED rather
     than FLAKY - the same call `report` makes, so `history` agrees."""
-    if passes and failures:
+    if (passes and failures) or retries:
         if stable_runs and pass_streak >= stable_runs:
             return RECOVERED
         return FLAKY
@@ -58,13 +64,17 @@ def stats(outcomes_newest_first: list[str], stable_runs: int = 0) -> dict:
     """Pass/fail/skip counts, fail rate over executed runs, the current
     pass streak (consecutive newest passes; a skip neither extends nor
     breaks it) and the status from classify()."""
-    passes = sum(1 for o in outcomes_newest_first if o == "passed")
+    retries = sum(1 for o in outcomes_newest_first if o == RETRIED)
+    passes = sum(1 for o in outcomes_newest_first
+                 if o == "passed") + retries
     fails = sum(1 for o in outcomes_newest_first if o in FAIL_OUTCOMES)
     skips = sum(1 for o in outcomes_newest_first if o == "skipped")
     streak = 0
     for o in outcomes_newest_first:
         if o == "passed":
             streak += 1
+        elif o == RETRIED:
+            break
         elif o == "skipped":
             continue
         else:
@@ -76,9 +86,10 @@ def stats(outcomes_newest_first: list[str], stable_runs: int = 0) -> dict:
         "passes": passes,
         "failures": fails,
         "skips": skips,
-        "flake_rate": (fails / executed) if executed else 0.0,
+        "retries": retries,        # runs that failed, then passed on retry
+        "flake_rate": ((fails + retries) / executed) if executed else 0.0,
         "pass_streak": streak,
-        "status": classify(passes, fails, streak, stable_runs),
+        "status": classify(passes, fails, streak, stable_runs, retries),
     }
 
 
@@ -150,7 +161,7 @@ def analyze(conn, min_runs: int = 5, stable_runs: int = STABLE_RUNS,
             retired.append(s)
             continue
         s["retired"] = False
-        if s["runs"] < min_runs:
+        if s["runs"] < min_runs and not s["retries"]:
             continue  # not enough executed runs to say anything
         if s["status"] == FLAKY:  # classify() already set RECOVERED aside
             flaky.append(s)
