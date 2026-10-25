@@ -1,11 +1,9 @@
 # Flakebox (`flakebox`)
 
-Self-hosted flaky-test triage for small teams. Flaky tests eat 10–25% of
-CI compute and erode trust in every red build. Trunk and Datadog will sell
-you the fix per-seat; flakebox is the free, self-hosted alternative:
-ingest JUnit XML, detect flakiness statistically, quarantine the flakes,
-and get told when they're stable enough to come back. SQLite, stdlib-only,
-no SaaS.
+Self-hosted flaky-test triage for small teams. A flaky test erodes trust
+in every red build; flakebox ingests JUnit XML, detects flakiness
+statistically, quarantines the flakes, and tells you when they are stable
+enough to come back. SQLite, stdlib-only, no SaaS.
 
 ## Install
 
@@ -25,9 +23,14 @@ pip install git+https://github.com/calasdan-sketch/flakebox
 # in CI, after your test step (pytest --junitxml=reports/junit.xml):
 flakebox record --junit reports/junit.xml --commit="$GITHUB_SHA"
 
+# on a pull request, BEFORE record: which failures are known flakes?
+flakebox summary --junit reports/junit.xml
+
 # what is flaky?
 flakebox report
 flakebox report --format json
+flakebox report --max-flaky-percent 5        # exit 1 above 5% flaky
+flakebox report --quarantine-days 30         # list quarantines older than 30 days
 
 # quarantine the flaky set for pytest:
 flakebox quarantine --format pytest -o .
@@ -46,6 +49,9 @@ flakebox quarantine --format json
 flakebox unquarantine --test "pkg.Class::test_x"
 flakebox history --test "pkg.Class::test_x"   # per-test run history, same
                                               # thresholds/status words as report
+
+# a quarantine you looked at and want to keep (restarts its clock):
+flakebox retriage --test "pkg.Class::test_x"
 
 # carry the history around (CI artifact -> laptop, job -> aggregator):
 flakebox export --out flakebox-export.json
@@ -250,6 +256,59 @@ too deeply to parse are the same one-line error and exit 2, and so is an
 This is how CI's history reaches a laptop, and how per-job DBs of a
 matrix build become one (see the Action).
 
+## Known flakes, new failures, budgets and expiry
+
+`flakebox summary --junit reports/junit.xml` prints markdown for a pull
+request comment or a job summary. Of the tests that failed in that report
+it says which are **known flakes** (flaky in your recorded history, or
+quarantined), which are **new**, and which were **already failing** in
+every earlier run (broken, not flaky). For example:
+
+```text
+## Flakebox: 3 failures are known flakes; this one is new.
+```
+
+Run it **before** `flakebox record` of the same report. Recorded first, a
+test that fails for the first time would count as a known flake because of
+that very failure. A test that failed and then passed inside the report (a
+retry) is listed on its own. The text starts with a hidden marker line
+(`<!-- flakebox:summary -->`) so a step that posts a comment can find and
+update its own earlier one; flakebox itself only writes the markdown and
+never calls GitHub.
+
+- **Flake budget.** `--max-flaky-percent P` (on `report` and `summary`)
+  exits 1 when more than P percent of the active tests are flaky. "Active"
+  means every test with history that is not retired. `report --format json`
+  carries the numbers under `totals`.
+- **Quarantine expiry.** A quarantine that nobody looks at again hides a
+  test forever. `--quarantine-days N` (on `report`, `summary` and
+  `quarantine`; off by default) lists every quarantine older than N days.
+  `--quarantine-expiry warn` (the default) only prints it; `fail` also exits
+  1 until each one has been retriaged: `flakebox retriage --test ID` keeps
+  it and restarts the clock, `flakebox unquarantine --test ID` releases it.
+  A quarantine from an old database with no date never expires.
+- **Cost line.** `report` and `summary` end with one sentence built only
+  from your own recorded reports: in how many of the last 50 runs a flaky
+  test failed, how much reported test time those failed attempts took, and
+  how many runs repeated a commit that had already run (and their test
+  time). It is test time as the runner writes it in `time=`; CI setup,
+  queueing and checkout are not in a JUnit report, so it is a floor for the
+  cost of one run, not the CI bill. For a test that failed and passed on
+  retry the report keeps the longest attempt only. Nothing else (no price
+  per minute, no industry average) goes into it.
+
+## Other test runners
+
+flakebox reads JUnit XML, so any runner that writes it works. These are
+tested against reports written by the tools themselves
+(`tests/fixtures/README.txt` has the versions and commands):
+
+| runner | how to get the report | notes |
+|--------|-----------------------|-------|
+| jest | `jest-junit` reporter | test ids look like `describe name test name::describe name test name` (jest-junit's default repeats the name as the class); a jest retry (`jest.retryTimes`) writes only the final result |
+| vitest | `reporters: ['junit']`, `outputFile` | ids are `file::suite > test`; a vitest `retry` writes only the final result |
+| Go | `gotestsum --junitfile report.xml` | `--rerun-fails` writes each rerun as another `<testcase>`: a failed one followed by a passed one is recorded as a retry-pass; a parent test fails whenever one of its subtests fails |
+
 ## GitHub Action
 
 `action.yml` is a composite action (Linux and macOS runners; it calls `python3` under bash): restores the DB from cache, records
@@ -265,6 +324,7 @@ artifact-ready files.
     fail-on-flaky: "true"
     quarantine-output: flakebox/quarantine.json
     export-output: flakebox/history.json
+    comment-output: flakebox/comment.md   # optional, see below
 - uses: actions/upload-artifact@v4
   with:
     name: flakebox
@@ -282,6 +342,30 @@ release is tagged `v1`; until then use the branch, or pin a commit SHA.
 | `fail-on-flaky`     | `false`    | fail the step when flaky tests are found that are not quarantined |
 | `quarantine-output` | (off)      | run `flakebox quarantine --format json` after the report and write the whole set here |
 | `export-output`     | (off)      | `flakebox export --out` the history DB here   |
+| `summary`           | `true`     | before recording, write "known flakes vs new" for this report to the job summary |
+| `comment-output`    | (off)      | also write that markdown to this file, for a step that posts a pull-request comment |
+| `max-flaky-percent` | (off)      | fail the step above this percent of flaky active tests (0-100) |
+| `quarantine-days`   | (off)      | a quarantine older than this many days needs a new look |
+| `quarantine-expiry` | `warn`     | `fail` also fails the step until each expired quarantine is retriaged or released |
+
+To post the note as a pull-request comment without another dependency, a
+later step can use the `gh` CLI that GitHub-hosted runners include (the job
+needs `pull-requests: write`):
+
+```yaml
+# after the flakebox step above (comment-output: flakebox/comment.md)
+- if: github.event_name == 'pull_request'
+  env:
+    GH_TOKEN: ${{ github.token }}
+    PR: ${{ github.event.pull_request.number }}
+  run: gh pr comment "$PR" --body-file flakebox/comment.md --edit-last --create-if-none
+```
+
+`--edit-last` rewrites the last comment written by the same account, which
+on a GitHub-hosted runner is `github-actions[bot]`, shared with every other
+step that comments (pr-verify's, for one). If anything else comments on the
+pull request, drop `--edit-last --create-if-none` and accept one comment per
+push, or find your comment by the marker line yourself.
 
 **The acknowledgement loop.** The history DB lives in the CI cache, where
 nobody can run `flakebox quarantine` by hand — so on its own,

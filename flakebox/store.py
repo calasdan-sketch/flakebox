@@ -44,13 +44,17 @@ def connect(db_path: str) -> sqlite3.Connection:
     if db_path != ":memory:":
         os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
     conn = sqlite3.connect(db_path)
-    conn.executescript(SCHEMA)
-    _migrate(conn)
-    # concurrent writers on stock SQLite: wait instead of immediately
-    # raising "database is locked", and use WAL so readers don't block
-    # writers (no-op on :memory:, which has no journal file).
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        conn.executescript(SCHEMA)
+        _migrate(conn)
+        # concurrent writers on stock SQLite: wait instead of immediately
+        # raising "database is locked", and use WAL so readers don't block
+        # writers (no-op on :memory:, which has no journal file).
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=WAL")
+    except BaseException:
+        conn.close()    # a file that is not a database must not leak a handle
+        raise
     return conn
 
 
@@ -188,6 +192,17 @@ def quarantine_add(conn: sqlite3.Connection, test_id: str,
 def quarantine_remove(conn: sqlite3.Connection, test_id: str) -> None:
     conn.execute("DELETE FROM quarantine WHERE test_id = ?", (test_id,))
     conn.commit()
+
+
+def quarantine_touch(conn: sqlite3.Connection, test_id: str,
+                     at: int | None = None) -> bool:
+    """Restart a quarantine's clock (it was looked at again and stays).
+    Returns False when the test is not quarantined."""
+    cur = conn.execute("UPDATE quarantine SET quarantined_at = ? "
+                       "WHERE test_id = ?",
+                       (int(time.time()) if at is None else int(at), test_id))
+    conn.commit()
+    return cur.rowcount == 1
 
 
 def quarantined(conn: sqlite3.Connection) -> list[dict]:

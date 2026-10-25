@@ -127,10 +127,10 @@ def parse_bytes(raw: bytes, path: str = "", warn=_warn) -> list[dict]:
                 outcome, message = SKIPPED, ""
         elif tc.find("failure") is not None:
             el = tc.find("failure")
-            outcome, message = FAILED, (el.get("message", "") or "")[:500]
+            outcome, message = FAILED, failure_message(el)
         elif tc.find("error") is not None:
             el = tc.find("error")
-            outcome, message = ERROR, (el.get("message", "") or "")[:500]
+            outcome, message = ERROR, failure_message(el)
         else:
             outcome, message = PASSED, ""
         row = {"test_id": tid, "outcome": outcome,
@@ -153,6 +153,25 @@ def parse_bytes(raw: bytes, path: str = "", warn=_warn) -> list[dict]:
         if is_retry_pass(attempts[tid]):
             row["outcome"] = RETRIED  # keeps the failure's message
     return results
+
+
+#: what gotestsum writes as the message of every failure; says nothing
+_EMPTY_MESSAGES = ("", "failed", "failure")
+
+
+def failure_message(el) -> str:
+    """The reason a testcase failed, at most 500 characters: the element's
+    `message` attribute, or - when a runner leaves it empty (jest-junit) or
+    writes only "Failed" (gotestsum) - the first useful line of its text
+    (Go's `=== RUN` and `--- FAIL` bookkeeping lines are not useful)."""
+    attr = (el.get("message") or "").strip()
+    if attr.lower() not in _EMPTY_MESSAGES:
+        return attr[:500]
+    for line in (el.text or "").splitlines():
+        line = line.strip()
+        if line and not line.startswith(("=== ", "--- ")):
+            return line[:500]
+    return attr[:500]
 
 
 def is_retry_pass(attempts: list[str]) -> bool:

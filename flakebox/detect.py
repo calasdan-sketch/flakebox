@@ -112,8 +112,9 @@ def summarize(conn, test_id: str, window: int = 50,
 
 def analyze(conn, min_runs: int = 5, stable_runs: int = STABLE_RUNS,
             window: int = 50, retire_after: int = RETIRE_AFTER) -> dict:
-    """Return {flaky: [...], broken: [...], stable: [...], retired: [...]}
-    ranked lists.
+    """Return {flaky: [...], broken: [...], stable: [...], retired: [...],
+    totals: {active, flaky, flaky_percent}}: ranked lists, and the share of
+    active tests that are flaky (see totals()).
 
     Single batched query (the most recent `window` runs per test, via
     ROW_NUMBER over (created_at, id) - see store.NEWEST_FIRST), then the
@@ -182,5 +183,14 @@ def analyze(conn, min_runs: int = 5, stable_runs: int = STABLE_RUNS,
             [s["last_run"] for s in retired]).fetchall())
         for s in retired:
             s["last_commit"] = commits.get(s["last_run"])
+    active = len(by_test) - len(retired)
     return {"flaky": flaky, "broken": broken, "stable": stable,
-            "retired": retired}
+            "retired": retired, "totals": totals(active, len(flaky))}
+
+
+def totals(active: int, flaky: int) -> dict:
+    """The flake budget's inputs: `active` tests (everything with history
+    that is not retired) and how many of them are flaky now."""
+    return {"active": active, "flaky": flaky,
+            "flaky_percent": round(100.0 * flaky / active, 2) if active
+            else 0.0}

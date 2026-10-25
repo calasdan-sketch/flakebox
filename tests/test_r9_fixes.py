@@ -203,7 +203,8 @@ class TestActionWithoutPip(unittest.TestCase):
     def test_every_flakebox_step_sets_pythonpath_to_the_action(self):
         text = self.text()
         self.assertEqual(text.count("PYTHONPATH: ${{ github.action_path }}"),
-                         5)  # check, record, report, quarantine, export
+                         7)  # check, summary, record, report, quarantine,
+        #                     export, budget
 
     def test_the_check_step_runs_from_a_foreign_directory(self):
         """What the runner does: cwd is the user's checkout, PYTHONPATH the

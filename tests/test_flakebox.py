@@ -670,7 +670,10 @@ class TestActionShellInjection(unittest.TestCase):
             context = {e: value for e in (
                 "inputs.junit", "inputs.min-runs", "inputs.quarantine-output",
                 "inputs.export-output", "github.sha", "github.ref_name",
-                "github.action_path", "steps.report.outputs.new_flaky")}
+                "github.action_path", "steps.report.outputs.new_flaky",
+                "inputs.summary", "inputs.comment-output",
+                "inputs.max-flaky-percent", "inputs.quarantine-days",
+                "inputs.quarantine-expiry")}
             for step in self.run_steps():
                 env = {"PATH": shims + os.pathsep + os.environ.get("PATH", ""),
                        "HOME": _fake_home, "FB_SHIM_LOG": log,
@@ -697,6 +700,8 @@ class TestActionShellInjection(unittest.TestCase):
             # every hostile string arrived as exactly one argument
             self.assertEqual(calls, [
                 ["python3", "-m", "flakebox", "--version"],
+                ["python3", "-m", "flakebox", "summary", f"--junit={value}",
+                 f"--min-runs={value}"],
                 ["python3", "-m", "flakebox", "record", f"--junit={value}",
                  f"--commit={value}", f"--branch={value}"],
                 ["python3", "-m", "flakebox", "report", f"--min-runs={value}"],
@@ -704,7 +709,11 @@ class TestActionShellInjection(unittest.TestCase):
                  f"--min-runs={value}"],
                 ["python3", "-m", "flakebox", "quarantine", "--format", "json",
                  f"--min-runs={value}"],
-                ["python3", "-m", "flakebox", "export", f"--out={value}"]],
+                ["python3", "-m", "flakebox", "export", f"--out={value}"],
+                ["python3", "-m", "flakebox", "report", f"--min-runs={value}",
+                 f"--max-flaky-percent={value}",
+                 f"--quarantine-days={value}",
+                 f"--quarantine-expiry={value}"]],
                 f"for {value!r}")
             with open(output, encoding="utf-8") as f:
                 self.assertEqual(f.read(), "new_flaky=0\n")
@@ -1587,7 +1596,9 @@ def reference_analyze(conn, min_runs=5, stable_runs=10, window=50,
     broken.sort(key=lambda s: -s["failures"])
     retired.sort(key=lambda s: (rank[s["last_run"]], s["test_id"]))
     return {"flaky": flaky, "broken": broken, "stable": stable,
-            "retired": retired}
+            "retired": retired,
+            "totals": detect_mod.totals(len(all_ids) - len(retired),
+                                        len(flaky))}
 
 
 EQUIVALENCE_QUARANTINED = (3, 37, 66, 99, 121, 130, 140)
@@ -1720,7 +1731,7 @@ def verdicts(analysis: dict) -> dict:
     on the order the runs arrived in) - what must not depend on it."""
     return {bucket: {s["test_id"]: {k: v for k, v in s.items() if k != "last_run"}
                      for s in analysis[bucket]}
-            for bucket in analysis}
+            for bucket in analysis if bucket != "totals"}
 
 
 class TestRecencyOrder(unittest.TestCase):
@@ -2507,7 +2518,8 @@ class TestDbFlagPosition(unittest.TestCase):
         subs = next(a for a in parser._actions
                     if isinstance(a, argparse_sub_type())).choices
         self.assertEqual(sorted(subs), ["export", "history", "import", "quarantine",
-                                        "record", "report", "unquarantine"])
+                                        "record", "report", "retriage",
+                                        "summary", "unquarantine"])
         for name, sub in subs.items():
             self.assertIn("--db", sub.format_help(), name)
 

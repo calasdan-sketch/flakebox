@@ -4,6 +4,7 @@ Ingests JUnit XML, detects flakiness statistically, quarantines the
 flakes, and tells you when they're stable enough to come back.
 
   flakebox record --junit reports/junit.xml --commit="$SHA"
+  flakebox summary --junit reports/junit.xml   # known flakes vs new failures
   flakebox report                        # flaky / broken / stable tables
   flakebox quarantine --format pytest -o .   # skip flakes in CI
   flakebox unquarantine --test pkg.Class::test_x
@@ -23,12 +24,14 @@ import os
 import sqlite3
 import sys
 
+from . import cost as cost_mod
 from . import detect as detect_mod
 from . import junit as junit_mod
 from . import quarantine as quar_mod
 from . import store as store_mod
+from . import summary as summary_mod
 
-VERSION = "0.4.6"
+VERSION = "0.5.0"
 
 
 def default_db() -> str:
@@ -154,16 +157,72 @@ def _pct(f: float) -> str:
     return f"{f:.0%}"
 
 
-def cmd_report(args) -> int:
+def evaluate_gates(args, analysis: dict, entries: list[dict],
+                   now: float | None = None) -> dict:
+    """The two optional gates over one analysis: the flake budget
+    (--max-flaky-percent) and quarantine expiry (--quarantine-days).
+    {"budget": {...} | None, "expired": [...], "failed": bool,
+    "messages": [...]}; `failed` is what makes the exit status 1."""
+    out = {"budget": None, "expired": [], "failed": False, "messages": []}
+    limit = getattr(args, "max_flaky_percent", None)
+    if limit is not None:
+        t = analysis["totals"]
+        over = t["flaky"] * 100 > limit * t["active"]
+        out["budget"] = {"limit_percent": limit, "flaky": t["flaky"],
+                         "active": t["active"],
+                         "flaky_percent": t["flaky_percent"],
+                         "exceeded": over}
+        text = (f"{t['flaky']} of {t['active']} test(s) are flaky "
+                f"({t['flaky_percent']:g}%); the limit is {limit:g}%")
+        if over:
+            out["failed"] = True
+            out["messages"].append(f"flake budget exceeded: {text}")
+        out["budget"]["text"] = text
+    days = getattr(args, "quarantine_days", None)
+    out["expired"] = quar_mod.expired(entries, days, now)
+    if out["expired"]:
+        mode = getattr(args, "quarantine_expiry", "warn")
+        names = ", ".join(e["test_id"] for e in out["expired"][:5])
+        more = len(out["expired"]) - 5
+        out["messages"].append(
+            f"{'error' if mode == 'fail' else 'warning'}: "
+            f"{len(out['expired'])} quarantined test(s) are older than "
+            f"{days} day(s) and need a new look ({names}"
+            f"{f', and {more} more' if more > 0 else ''}); run "
+            f"flakebox retriage --test ID to keep one, or flakebox "
+            f"unquarantine --test ID to release it")
+        if mode == "fail":
+            out["failed"] = True
+    return out
+
+
+def _gate_exit(gates: dict) -> int:
+    for m in gates["messages"]:
+        print(m, file=sys.stderr)
+    return 1 if gates["failed"] else 0
+
+
+def _analysis(args):
+    """(analysis, quarantine entries, cost estimate) from the database."""
     conn = _db(args.db)
     try:
         a = detect_mod.analyze(conn, args.min_runs, args.stable_runs,
                                retire_after=args.retire_after)
+        entries = store_mod.quarantined(conn)
+        est = cost_mod.estimate(conn, [s["test_id"] for s in a["flaky"]])
     finally:
         conn.close()
+    return a, entries, est
+
+
+def cmd_report(args) -> int:
+    a, entries, est = _analysis(args)
+    gates = evaluate_gates(args, a, entries)
     if args.format == "json":
-        print(json.dumps(a, indent=2))
-        return 0
+        out = dict(a, cost=est, budget=gates["budget"],
+                   expired=gates["expired"])
+        print(json.dumps(out, indent=2))
+        return _gate_exit(gates)
     print(f"\n# Flakebox report ({args.db or default_db()})\n")
     if a["flaky"]:
         print("## Flaky (pass AND fail - quarantine candidates)")
@@ -188,6 +247,15 @@ def cmd_report(args) -> int:
             print(f"- `{s['test_id']}` ({s['failures']} failures, "
                   f"0 passes)")
         print()
+    if gates["expired"]:
+        print(f"## Quarantine older than {args.quarantine_days} day(s) - "
+              f"look again")
+        for e in gates["expired"]:
+            print(f"- `{e['test_id']}` ({e['days']} days)")
+            print(f"  keep it: flakebox retriage --test \"{e['test_id']}\""
+                  f"   release it: flakebox unquarantine --test "
+                  f"\"{e['test_id']}\"")
+        print()
     if a["stable"]:
         print("## Stable - ready to un-quarantine")
         for s in a["stable"]:
@@ -204,6 +272,57 @@ def cmd_report(args) -> int:
             print(f"- `{s['test_id']}` (was {s['status']}; last seen run "
                   f"{s['last_run']}, commit {s.get('last_commit') or '-'}){q}")
         print()
+    if gates["budget"]:
+        print(f"Flake budget: {gates['budget']['text']}"
+              f"{' - EXCEEDED' if gates['budget']['exceeded'] else ' - ok'}")
+        print()
+    cost = cost_mod.line(est)
+    if cost:
+        print(cost)
+        print()
+    return _gate_exit(gates)
+
+
+def cmd_summary(args) -> int:
+    """Markdown for a PR comment or job summary about ONE report: which of
+    its failures are known flakes and which are new. Run before `record`."""
+    try:
+        raw = junit_mod.read(args.junit)
+        results = junit_mod.parse_bytes(raw, args.junit)
+    except FileNotFoundError:
+        print(f"error: no such file: {args.junit}", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"error: cannot parse {args.junit}: {e}", file=sys.stderr)
+        return 2
+    a, entries, est = _analysis(args)
+    gates = evaluate_gates(args, a, entries)
+    c = summary_mod.classify(results, a, [q["test_id"] for q in entries])
+    budget = None
+    if gates["budget"]:
+        b = gates["budget"]
+        budget = (f"Flake budget: {b['text']}"
+                  f"{' - **exceeded**' if b['exceeded'] else ' - ok'}.")
+    _lf_only(sys.stdout)
+    sys.stdout.write(summary_mod.to_markdown(
+        c, est, gates["expired"], getattr(args, "quarantine_days", None),
+        budget))
+    return _gate_exit(gates)
+
+
+def cmd_retriage(args) -> int:
+    """Keep a quarantined test and restart its expiry clock."""
+    conn = _db(args.db)
+    try:
+        ok = store_mod.quarantine_touch(conn, args.test)
+    finally:
+        conn.close()
+    if not ok:
+        print(f"error: {args.test} is not quarantined; nothing to retriage "
+              f"(flakebox quarantine --help)", file=sys.stderr)
+        return 2
+    print(f"retriaged {args.test}: it stays quarantined and its "
+          f"--quarantine-days clock starts again now")
     return 0
 
 
@@ -219,9 +338,11 @@ def cmd_quarantine(args) -> int:
         new = [s["test_id"] for s in a["flaky"]
                if store_mod.quarantine_add(conn, s["test_id"],
                                            reason="auto: flaky")]
-        full = sorted(q["test_id"] for q in store_mod.quarantined(conn))
+        entries = store_mod.quarantined(conn)
+        full = sorted(q["test_id"] for q in entries)
     finally:
         conn.close()
+    gates = evaluate_gates(args, a, entries)
     summary = (f"quarantined {len(new)} new test(s); "
                f"{len(full)} in quarantine.")
     if args.format == "pytest":
@@ -250,7 +371,7 @@ def cmd_quarantine(args) -> int:
         print(quar_mod.deselect_line(full))
     else:
         print(json.dumps({"quarantined": full, "new": new}, indent=2))
-    return 0
+    return _gate_exit(gates)
 
 
 def cmd_unquarantine(args) -> int:
@@ -357,6 +478,32 @@ def _min_runs(text: str) -> int:
     return n
 
 
+def _days(text: str) -> int:
+    """--quarantine-days: a whole number of days >= 1."""
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid int value: {text!r}") from None
+    if not 1 <= n <= 36500:
+        raise argparse.ArgumentTypeError(
+            f"must be between 1 and 36500, got {n}")
+    return n
+
+
+def _percent(text: str) -> float:
+    """--max-flaky-percent: a number from 0 to 100."""
+    try:
+        x = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid number: {text!r}") from None
+    if not 0 <= x <= 100:      # also false for nan
+        raise argparse.ArgumentTypeError(
+            f"must be between 0 and 100, got {text}")
+    return x
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="flakebox", description=__doc__,
@@ -386,6 +533,22 @@ def build_parser() -> argparse.ArgumentParser:
                              "0 disables)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    expiry = argparse.ArgumentParser(add_help=False)
+    expiry.add_argument("--quarantine-days", type=_days, default=None,
+                        metavar="N",
+                        help="a quarantine older than N days needs a new "
+                             "look (default: off)")
+    expiry.add_argument("--quarantine-expiry", choices=["warn", "fail"],
+                        default="warn",
+                        help="what an expired quarantine does: warn on "
+                             "stderr (default) or also exit 1, until the "
+                             "test is retriaged or released")
+    budget = argparse.ArgumentParser(add_help=False)
+    budget.add_argument("--max-flaky-percent", type=_percent, default=None,
+                        metavar="P",
+                        help="exit 1 when more than P percent of the "
+                             "active tests are flaky (0-100; default: off)")
+
     r = sub.add_parser("record", parents=[common],
                        help="Ingest a JUnit XML report.")
     r.add_argument("--junit", required=True)
@@ -400,12 +563,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "it is nearly always a test step that broke, and "
                         "three of them in a row retire every test")
 
-    rp = sub.add_parser("report", parents=[common, detect],
+    rp = sub.add_parser("report", parents=[common, detect, expiry, budget],
                         help="Flaky / broken / stable / retired tables.")
     rp.add_argument("--format", choices=["markdown", "json"],
                     default="markdown")
 
-    q = sub.add_parser("quarantine", parents=[common, detect],
+    q = sub.add_parser("quarantine", parents=[common, detect, expiry],
                        help="Quarantine the flaky set.")
     q.add_argument("--format", choices=["pytest", "json", "deselect"],
                    default="pytest")
@@ -415,6 +578,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="pytest plugin behaviour for quarantined tests: "
                         "skip them (default) or run them as non-strict "
                         "xfail so they keep recording results")
+
+    sm = sub.add_parser("summary", parents=[common, detect, expiry, budget],
+                        help="Markdown for a PR comment or job summary: "
+                             "which failures in a report are known flakes "
+                             "and which are new (run before `record`).")
+    sm.add_argument("--junit", required=True)
+
+    rt = sub.add_parser("retriage", parents=[common],
+                        help="Keep a quarantined test and restart its "
+                             "--quarantine-days clock.")
+    rt.add_argument("--test", required=True, type=_utf8)
 
     u = sub.add_parser("unquarantine", parents=[common], help="Release a test.")
     u.add_argument("--test", required=True, type=_utf8)
@@ -476,7 +650,8 @@ def _broken_pipe() -> int:
 def main(argv=None) -> int:
     _harden_streams()
     args = build_parser().parse_args(argv)
-    cmds = {"record": cmd_record, "report": cmd_report,
+    cmds = {"record": cmd_record, "report": cmd_report, "summary": cmd_summary,
+            "retriage": cmd_retriage,
             "quarantine": cmd_quarantine, "unquarantine": cmd_unquarantine,
             "history": cmd_history, "export": cmd_export,
             "import": cmd_import}

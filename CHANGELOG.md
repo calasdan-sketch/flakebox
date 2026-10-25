@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0
+
+- `flakebox summary --junit REPORT`: markdown for a pull-request comment or a job summary that says which of this report's failures are known flakes and which are new ("3 failures are known flakes; this one is new"), lists tests that failed and passed on retry, and says which failures were already failing before (broken, not flaky). Run it before `flakebox record` of the same report.
+- `--max-flaky-percent P` on `report` and `summary`: exit 1 when more than P percent of the active tests are flaky. `report --format json` now has a `totals` block (and `budget`).
+- `--quarantine-days N` (off by default) with `--quarantine-expiry warn|fail` on `report`, `summary` and `quarantine`: a quarantine older than N days is listed, and with `fail` the command exits 1 until each one is looked at again. New `flakebox retriage --test ID` keeps a quarantined test and restarts its clock.
+- A cost line in `report` and `summary`, built only from the `time` attributes and commits in the reports you recorded: how many recent runs a flaky test failed in, how much reported test time those failed attempts took, and how many runs repeated a commit that had already run. It is test time as the runner reports it, not CI wall-clock time. `report --format json` has it as `cost`.
+- Removed the README's unsourced "10-25% of CI compute" claim.
+- Failure messages: when a runner leaves `message` empty (jest-junit) or writes only "Failed" (gotestsum), the first useful line of the failure text is used.
+- Reports from jest (jest-junit), vitest and Go (gotestsum, including `--rerun-fails`) are tested against real files written by those tools.
+- The Action has new inputs `summary`, `comment-output`, `max-flaky-percent`, `quarantine-days` and `quarantine-expiry`.
+
 ## 0.4.6
 
 - A test that fails and then passes inside one JUnit report (a retry plugin) is now recorded as a flake ("retried"), not hidden behind the worst outcome. `flakebox report` lists it ("Passed on retry"), `flakebox history` calls it flaky, and one such run is enough (it does not wait for `--min-runs`). A pass followed by a failure is still a failure. A duplicated test keeps its longest duration.
