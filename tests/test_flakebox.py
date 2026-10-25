@@ -647,14 +647,14 @@ class TestActionShellInjection(unittest.TestCase):
         write_raw(tmp, "shim.py", (
             "import json, os, sys\n"
             "tool, argv = sys.argv[1], sys.argv[2:]\n"
-            "if tool == 'pip' or argv[:2] == ['-m', 'flakebox']:\n"
+            "if argv[:2] in (['-m', 'pip'], ['-m', 'flakebox']):\n"
             "    with open(os.environ['FB_SHIM_LOG'], 'a', encoding='utf-8') as f:\n"
             "        f.write(json.dumps([tool] + argv) + '\\n')\n"
             "    if 'json' in argv:\n"
             "        print('{\"flaky\": [], \"quarantined\": [], \"new\": []}')\n"
             "    sys.exit(0)\n"
             "os.execv(sys.executable, [sys.executable] + argv)\n"))
-        for tool in ("python3", "pip"):
+        for tool in ("python3",):
             shim = os.path.join(shims, tool)
             write_raw(shims, tool, "#!/bin/sh\nexec %s %s %s \"$@\"\n" % (
                 shlex.quote(sys.executable), shlex.quote(shim_py), tool))
@@ -694,7 +694,7 @@ class TestActionShellInjection(unittest.TestCase):
                 calls = [json.loads(ln) for ln in f.read().splitlines()]
             # every hostile string arrived as exactly one argument
             self.assertEqual(calls, [
-                ["pip", "install", value],
+                ["python3", "-m", "pip", "install", value],
                 ["python3", "-m", "flakebox", "record", f"--junit={value}",
                  f"--commit={value}", f"--branch={value}"],
                 ["python3", "-m", "flakebox", "report", f"--min-runs={value}"],
@@ -4112,3 +4112,88 @@ class TestDeselectLineEnding(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Round 9 fixes.
+# ---------------------------------------------------------------------------
+
+
+class TestRound9(unittest.TestCase):
+    def junit(self, cases):
+        body = "".join(cases)
+        return ("<testsuite>" + body + "</testsuite>").encode()
+
+    def test_duplicate_testcase_collapses_to_worst_outcome(self):
+        raw = self.junit([
+            '<testcase classname="a.B" name="t" time="1"/>',
+            '<testcase classname="a.B" name="t" time="2"><failure message="x"/></testcase>',
+            '<testcase classname="a.B" name="t" time="1"/>',
+            '<testcase classname="a.B" name="u"/>'])
+        res = junit_mod.parse_bytes(raw)
+        self.assertEqual([r["test_id"] for r in res], ["a.B::t", "a.B::u"])
+        self.assertEqual(res[0]["outcome"], "failed")
+        self.assertEqual(res[0]["message"], "x")
+
+    def test_duplicate_error_beats_failure_and_skip_loses_to_pass(self):
+        raw = self.junit([
+            '<testcase name="e"><failure message="f"/></testcase>',
+            '<testcase name="e"><error message="boom"/></testcase>',
+            '<testcase name="s"><skipped/></testcase>',
+            '<testcase name="s"/>'])
+        res = {r["test_id"]: r["outcome"] for r in junit_mod.parse_bytes(raw)}
+        self.assertEqual(res, {"e": "error", "s": "passed"})
+
+    def test_duplicates_in_one_report_count_as_one_run(self):
+        tmp = mktemp()
+        rep = os.path.join(tmp, "r.xml")
+        with open(rep, "wb") as f:
+            f.write(self.junit(['<testcase name="t"/>', '<testcase name="t"/>']))
+        db = os.path.join(tmp, "h.db")
+        code, out, _ = run_cli("--db", db, "record", "--junit", rep)
+        self.assertEqual(code, 0)
+        self.assertIn("1 tests", out)
+
+    def test_min_runs_below_one_is_rejected_with_exit_2(self):
+        for bad in ("0", "-3"):
+            for sub in ("report", "quarantine"):
+                err = io.StringIO()
+                with redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                    cli_mod.main(["--db", os.path.join(mktemp(), "h.db"),
+                                  sub, "--min-runs", bad])
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("--min-runs", err.getvalue())
+
+    def test_min_runs_one_is_accepted(self):
+        code, _, _ = run_cli("--db", os.path.join(mktemp(), "h.db"),
+                             "report", "--format", "json", "--min-runs", "1")
+        self.assertEqual(code, 0)
+
+    def test_unquarantine_hint_says_only_when_stable(self):
+        tmp = mktemp()
+        db = os.path.join(tmp, "h.db")
+        code, out, _ = run_cli("--db", db, "unquarantine", "--test", "a::b")
+        self.assertEqual(code, 0)
+        self.assertIn("only when it is stable now", out)
+
+    def test_action_installs_with_the_interpreter_it_runs_and_save_key_has_attempt(self):
+        text = action_text()
+        self.assertIn('python3 -m pip install "$FB_ACTION_PATH"', text)
+        self.assertNotRegex(text, r"(?m)run:\s+pip install")
+        save = text[text.index("Save flakebox history"):]
+        self.assertIn("github.run_attempt", save)
+
+    def test_metadata_and_workflows_present(self):
+        with open(os.path.join(REPO, "pyproject.toml"), encoding="utf-8") as f:
+            py = f.read()
+        for needle in ("Calas Automations Inc.", "Framework :: Pytest",
+                       "Development Status :: 4 - Beta", "Python :: 3.14",
+                       "[project.urls]", "Issues ="):
+            self.assertIn(needle, py)
+        wf = os.path.join(REPO, *(".github", "workflows"))
+        if os.path.isdir(wf):       # not shipped in the sdist
+            with open(os.path.join(wf, "release.yml"), encoding="utf-8") as f:
+                rel = f.read()
+            self.assertIn("id-token: write", rel)
+            self.assertEqual(rel.count("id-token: write"), 1)
+            self.assertIn("pypa/gh-action-pypi-publish", rel)

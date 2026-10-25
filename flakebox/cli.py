@@ -28,7 +28,7 @@ from . import junit as junit_mod
 from . import quarantine as quar_mod
 from . import store as store_mod
 
-VERSION = "0.4.4"
+VERSION = "0.4.5"
 
 
 def default_db() -> str:
@@ -184,7 +184,8 @@ def cmd_report(args) -> int:
         print("## Stable - ready to un-quarantine")
         for s in a["stable"]:
             print(f"- `{s['test_id']}` ({s['pass_streak']} consecutive passes)")
-            print(f"  run: flakebox unquarantine --test \"{s['test_id']}\"")
+            print(f"  run, only if it is stable now: flakebox unquarantine "
+                  f"--test \"{s['test_id']}\"")
         print()
     if a["retired"]:
         print(f"## Retired (absent from the last {args.retire_after} runs - "
@@ -252,6 +253,8 @@ def cmd_unquarantine(args) -> int:
         conn.close()
     print(f"un-quarantined {args.test}")
     print("regenerate the pytest plugin: flakebox quarantine --format pytest")
+    print("note: release a test only when it is stable now; a test that "
+          "still flakes is quarantined again by the next report")
     return 0
 
 
@@ -333,6 +336,19 @@ def cmd_import(args) -> int:
     return 0
 
 
+def _min_runs(text: str) -> int:
+    """--min-runs: a whole number >= 1 (0 or less would call a test with no
+    executed runs flaky or failing)."""
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid int value: {text!r}") from None
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {n}")
+    return n
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="flakebox", description=__doc__,
@@ -347,7 +363,7 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--db", default=argparse.SUPPRESS, metavar="PATH",
                         help="SQLite DB path (same as the top-level --db)")
     detect = argparse.ArgumentParser(add_help=False)
-    detect.add_argument("--min-runs", type=int, default=5,
+    detect.add_argument("--min-runs", type=_min_runs, default=5,
                         help="executed runs (skips excluded) before a test "
                              "can be called flaky or failing (default 5)")
     detect.add_argument("--stable-runs", type=int,

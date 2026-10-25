@@ -12,8 +12,11 @@ no SaaS.
 Zero dependencies — Python 3.10+ stdlib only.
 
 ```bash
-pip install git+https://github.com/calasdan-sketch/flakebox
+pip install flakebox
 flakebox --version
+
+# or from source
+pip install git+https://github.com/calasdan-sketch/flakebox
 ```
 
 ## Usage
@@ -241,7 +244,7 @@ matrix build become one (see the Action).
 
 ## GitHub Action
 
-`action.yml` is a composite action: restores the DB from cache, records
+`action.yml` is a composite action (Linux and macOS runners; it calls `python3` under bash): restores the DB from cache, records
 the JUnit report, posts the flakebox report to the job summary, and —
 optionally — quarantines the flaky set and exports the history as
 artifact-ready files.

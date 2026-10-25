@@ -12,6 +12,9 @@ from .quarantine import REASON as QUARANTINE_REASON
 # outcome per testcase
 PASSED, FAILED, ERROR, SKIPPED = "passed", "failed", "error", "skipped"
 
+# worst outcome wins when one report repeats a test
+_SEVERITY = {SKIPPED: 0, PASSED: 1, FAILED: 2, ERROR: 3}
+
 MAX_MS = 2 ** 63 - 1  # the largest duration an SQLite INTEGER can hold
 
 
@@ -102,6 +105,7 @@ def parse_bytes(raw: bytes, path: str = "", warn=_warn) -> list[dict]:
     check_no_dtd(raw, path)
     root = ET.fromstring(raw)
     results = []
+    seen: dict[str, dict] = {}
     cases = [root] if root.tag == "testcase" else root.iter("testcase")
     for tc in cases:
         tid = test_id(tc.get("classname", ""), tc.get("name", ""))
@@ -123,8 +127,19 @@ def parse_bytes(raw: bytes, path: str = "", warn=_warn) -> list[dict]:
             outcome, message = ERROR, (el.get("message", "") or "")[:500]
         else:
             outcome, message = PASSED, ""
-        results.append({"test_id": tid, "outcome": outcome,
-                        "duration_ms": ms, "message": message})
+        row = {"test_id": tid, "outcome": outcome,
+               "duration_ms": ms, "message": message}
+        # the same classname+name twice in one report (a retry plugin, a
+        # parametrised id that collapses) is ONE run of that test: the
+        # worst outcome wins, so one report never counts as two runs
+        prev = seen.get(tid)
+        if prev is None:
+            seen[tid] = row
+            results.append(row)
+        elif _SEVERITY[outcome] > _SEVERITY[prev["outcome"]]:
+            prev.update(row)
+        else:
+            prev["duration_ms"] = max(prev["duration_ms"], ms)
     return results
 
 

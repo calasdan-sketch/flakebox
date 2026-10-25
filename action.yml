@@ -87,6 +87,12 @@ runs:
           ${{ inputs.db-key }}-${{ github.job }}-refs/heads/main-
 
     # ------------------------------------------------------------------
+    # PLATFORM: Linux and macOS runners only. The scripts run under bash and
+    # call `python3` (put on PATH by actions/setup-python or the runner
+    # image); Windows runners expose `python`, not `python3`. The save key
+    # ends in github.run_attempt so a re-run of the same run id saves a new
+    # entry instead of failing on "key already exists" (caches are immutable).
+    #
     # NO EXPRESSIONS IN `run:` (shell injection):
     #
     # GitHub pastes the value of a ${{ ... }} expression into the script
@@ -112,7 +118,7 @@ runs:
       shell: bash
       env:
         FB_ACTION_PATH: ${{ github.action_path }}
-      run: pip install "$FB_ACTION_PATH"
+      run: python3 -m pip install "$FB_ACTION_PATH"
 
     - name: Record results
       shell: bash
@@ -177,4 +183,4 @@ runs:
       if: always()
       with:
         path: ~/.flakebox/history.db
-        key: ${{ inputs.db-key }}-${{ github.job }}-${{ github.ref }}-${{ github.run_id }}
+        key: ${{ inputs.db-key }}-${{ github.job }}-${{ github.ref }}-${{ github.run_id }}-${{ github.run_attempt }}
