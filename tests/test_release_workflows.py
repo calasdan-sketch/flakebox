@@ -38,6 +38,7 @@ def _git(cwd, *args, check=True):
     return p.stdout.strip()
 
 
+@unittest.skipIf(os.name == "nt", "the release job runs bash on Ubuntu; its steps are run here with bash and a symlinked python shim")
 @unittest.skipUnless(HAVE_WF, "workflows are not shipped in the sdist")
 class TestReleaseWorkflow(unittest.TestCase):
     @classmethod

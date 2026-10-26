@@ -2,6 +2,8 @@
 
 ## 0.5.0
 
+- Deeply nested JSON in `import` is refused by a depth limit of our own (400 levels) instead of relying on RecursionError, which Python 3.14 does not raise with a large stack. Tests: the bash-run release-workflow steps are skipped on Windows.
+
 - `flakebox summary --junit REPORT`: markdown for a pull-request comment or a job summary that says which of this report's failures are known flakes and which are new ("3 failures are known flakes; this one is new"), lists tests that failed and passed on retry, and says which failures were already failing before (broken, not flaky). Run it before `flakebox record` of the same report.
 - `--max-flaky-percent P` on `report` and `summary`: exit 1 when more than P percent of the active tests are flaky. `report --format json` now has a `totals` block (and `budget`).
 - `--quarantine-days N` (off by default) with `--quarantine-expiry warn|fail` on `report`, `summary` and `quarantine`: a quarantine older than N days is listed, and with `fail` the command exits 1 until each one is looked at again. New `flakebox retriage --test ID` keeps a quarantined test and restarts its clock.

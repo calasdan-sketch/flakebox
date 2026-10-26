@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from . import _depth as depth_mod
 import math
 import os
 import sqlite3
@@ -372,7 +373,7 @@ def import_file(conn: sqlite3.Connection, path: str) -> dict:
     deeper than the parser can follow included)."""
     with open(path, encoding="utf-8") as f:
         try:
-            data = json.load(f)
+            data = depth_mod.loads(f.read())
         except RecursionError:
             raise ValueError("nested too deeply") from None
     return import_data(conn, data)
