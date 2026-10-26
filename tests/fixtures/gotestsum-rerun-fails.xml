@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="14" failures="10" errors="0" time="21.722385">
+	<testsuite tests="14" failures="10" time="0.007000" name="example.com/fx" timestamp="2026-10-25T00:03:29-05:00">
+		<properties>
+			<property name="go.version" value="go1.24.7 linux/amd64"></property>
+		</properties>
+		<testcase classname="example.com/fx" name="TestFail" time="0.000000">
+			<failure message="Failed" type="">=== RUN   TestFail&#xA;    fx_test.go:10: boom&#xA;--- FAIL: TestFail (0.00s)&#xA;</failure>
+		</testcase>
+		<testcase classname="example.com/fx" name="TestSub/bad/case" time="0.000000">
+			<failure message="Failed" type="">=== RUN   TestSub/bad/case&#xA;    fx_test.go:16: sub failed&#xA;--- FAIL: TestSub/bad/case (0.00s)&#xA;</failure>
+		</testcase>
+		<testcase classname="example.com/fx" name="TestSub" time="0.000000">
+			<failure message="Failed" type="">=== RUN   TestSub&#xA;--- FAIL: TestSub (0.00s)&#xA;</failure>
+		</testcase>
+		<testcase classname="example.com/fx" name="TestFlaky" time="0.000000">
+			<failure message="Failed" type="">=== RUN   TestFlaky&#xA;    fx_test.go:22: first attempt&#xA;--- FAIL: TestFlaky (0.00s)&#xA;</failure>
+		</testcase>
+		<testcase classname="example.com/fx" name="TestFail" time="0.000000">
+			<failure message="Failed" type="">=== RUN   TestFail&#xA;    fx_test.go:10: boom&#xA;--- FAIL: TestFail (0.00s)&#xA;</failure>
+		</testcase>
+		<testcase classname="example.com/fx" name="TestSub/bad/case" time="0.000000">
+			<failure message="Failed" type="">=== RUN   TestSub/bad/case&#xA;    fx_test.go:16: sub failed&#xA;--- FAIL: TestSub/bad/case (0.00s)&#xA;</failure>
+		</testcase>
+		<testcase classname="example.com/fx" name="TestSub" time="0.000000">
+			<failure message="Failed" type="">=== RUN   TestSub&#xA;--- FAIL: TestSub (0.00s)&#xA;</failure>
+		</testcase>
+		<testcase classname="example.com/fx" name="TestFail" time="0.000000">
+			<failure message="Failed" type="">=== RUN   TestFail&#xA;    fx_test.go:10: boom&#xA;--- FAIL: TestFail (0.00s)&#xA;</failure>
+		</testcase>
+		<testcase classname="example.com/fx" name="TestSub/bad/case" time="0.000000">
+			<failure message="Failed" type="">=== RUN   TestSub/bad/case&#xA;    fx_test.go:16: sub failed&#xA;--- FAIL: TestSub/bad/case (0.00s)&#xA;</failure>
+		</testcase>
+		<testcase classname="example.com/fx" name="TestSub" time="0.000000">
+			<failure message="Failed" type="">=== RUN   TestSub&#xA;--- FAIL: TestSub (0.00s)&#xA;</failure>
+		</testcase>
+		<testcase classname="example.com/fx" name="TestSkip" time="0.000000">
+			<skipped message="=== RUN   TestSkip&#xA;    fx_test.go:12: later&#xA;--- SKIP: TestSkip (0.00s)&#xA;"></skipped>
+		</testcase>
+		<testcase classname="example.com/fx" name="TestPass" time="0.000000"></testcase>
+		<testcase classname="example.com/fx" name="TestSub/ok_case" time="0.000000"></testcase>
+		<testcase classname="example.com/fx" name="TestFlaky" time="0.000000"></testcase>
+	</testsuite>
+</testsuites>

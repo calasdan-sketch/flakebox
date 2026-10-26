@@ -41,6 +41,41 @@ inputs:
       and an aggregator job can merge per-job exports the same way.
     required: false
     default: ""
+  summary:
+    description: >-
+      "true" (default) writes a short note to the job summary BEFORE the
+      results are recorded: of the tests that failed in this report, which
+      are known flakes and which are new. Set "false" to leave it out.
+    required: false
+    default: "true"
+  comment-output:
+    description: >-
+      If set, also write that note (markdown) to this file, for a step that
+      posts or updates a pull-request comment. The file starts with a hidden
+      marker line (flakebox:summary) so a later run can find its own
+      comment.
+    required: false
+    default: ""
+  max-flaky-percent:
+    description: >-
+      If set (0-100), fail the step when more than this percent of the
+      active tests are flaky. Empty (default) = no budget.
+    required: false
+    default: ""
+  quarantine-days:
+    description: >-
+      If set, a quarantine older than this many days needs a new look
+      (flakebox retriage / unquarantine). Empty (default) = quarantines
+      never expire.
+    required: false
+    default: ""
+  quarantine-expiry:
+    description: >-
+      "warn" (default) reports an expired quarantine as a warning; "fail"
+      also fails the step until each one is retriaged or released. Only
+      used when quarantine-days is set.
+    required: false
+    default: "warn"
 runs:
   using: "composite"
   steps:
@@ -87,6 +122,12 @@ runs:
           ${{ inputs.db-key }}-${{ github.job }}-refs/heads/main-
 
     # ------------------------------------------------------------------
+    # PLATFORM: Linux and macOS runners only. The scripts run under bash and
+    # call `python3` (put on PATH by actions/setup-python or the runner
+    # image); Windows runners expose `python`, not `python3`. The save key
+    # ends in github.run_attempt so a re-run of the same run id saves a new
+    # entry instead of failing on "key already exists" (caches are immutable).
+    #
     # NO EXPRESSIONS IN `run:` (shell injection):
     #
     # GitHub pastes the value of a ${{ ... }} expression into the script
@@ -108,15 +149,54 @@ runs:
     # first-party and referenced by their major tag (v4), not by a commit
     # SHA. Pin them to a SHA in a fork if your policy requires it.
     # ------------------------------------------------------------------
-    - name: Install flakebox
+    # ------------------------------------------------------------------
+    # NO pip: flakebox is stdlib-only, so the action runs the copy of the
+    # package that sits in the action's own checkout (PYTHONPATH on each
+    # step, never exported to the rest of the job). `pip install` into the
+    # runner's system Python fails on a distribution-managed Python
+    # ("externally-managed-environment", PEP 668) and a venv needs a package
+    # some images lack; running from the checkout needs neither and cannot
+    # leave a stale install behind. The first step fails with one clear line
+    # if python3 is missing or too old.
+    # ------------------------------------------------------------------
+    - name: Check flakebox runs
       shell: bash
       env:
-        FB_ACTION_PATH: ${{ github.action_path }}
-      run: pip install "$FB_ACTION_PATH"
+        PYTHONPATH: ${{ github.action_path }}
+      run: |
+        if ! python3 -m flakebox --version; then
+          echo "::error::flakebox needs Python 3.10 or newer as python3 on the runner (add actions/setup-python before this step)"
+          exit 1
+        fi
+
+    # Before "Record results" on purpose: the history must not yet contain
+    # this run, or a test that fails for the first time would count as a
+    # known flake because of that very failure.
+    - name: Summarize this report (known flakes vs new)
+      if: inputs.summary == 'true' || inputs.comment-output != ''
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}
+        FB_JUNIT: ${{ inputs.junit }}
+        FB_MIN_RUNS: ${{ inputs.min-runs }}
+        FB_SUMMARY: ${{ inputs.summary }}
+        FB_COMMENT_OUTPUT: ${{ inputs.comment-output }}
+      run: |
+        note="$(mktemp)"
+        python3 -m flakebox summary --junit="$FB_JUNIT" --min-runs="$FB_MIN_RUNS" > "$note"
+        if [ "$FB_SUMMARY" = "true" ]; then
+          cat -- "$note" >> "$GITHUB_STEP_SUMMARY"
+        fi
+        if [ "${FB_COMMENT_OUTPUT:+set}" = set ]; then
+          mkdir -p -- "$(dirname -- "$FB_COMMENT_OUTPUT")"
+          cp -- "$note" "$FB_COMMENT_OUTPUT"
+        fi
+        rm -f -- "$note"
 
     - name: Record results
       shell: bash
       env:
+        PYTHONPATH: ${{ github.action_path }}
         FB_JUNIT: ${{ inputs.junit }}
         FB_COMMIT: ${{ github.sha }}
         FB_BRANCH: ${{ github.ref_name }}
@@ -130,6 +210,7 @@ runs:
       id: report
       shell: bash
       env:
+        PYTHONPATH: ${{ github.action_path }}
         FB_MIN_RUNS: ${{ inputs.min-runs }}
       run: |
         python3 -m flakebox report --min-runs="$FB_MIN_RUNS" >> "$GITHUB_STEP_SUMMARY"
@@ -147,6 +228,7 @@ runs:
       if: inputs.quarantine-output != ''
       shell: bash
       env:
+        PYTHONPATH: ${{ github.action_path }}
         FB_MIN_RUNS: ${{ inputs.min-runs }}
         FB_QUARANTINE_OUTPUT: ${{ inputs.quarantine-output }}
       run: |
@@ -158,10 +240,33 @@ runs:
       if: inputs.export-output != ''
       shell: bash
       env:
+        PYTHONPATH: ${{ github.action_path }}
         FB_EXPORT_OUTPUT: ${{ inputs.export-output }}
       run: |
         mkdir -p -- "$(dirname -- "$FB_EXPORT_OUTPUT")"
         python3 -m flakebox export --out="$FB_EXPORT_OUTPUT"
+
+    - name: Check the flake budget and quarantine age (optional)
+      if: inputs.max-flaky-percent != '' || inputs.quarantine-days != ''
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}
+        FB_MIN_RUNS: ${{ inputs.min-runs }}
+        FB_MAX_FLAKY_PERCENT: ${{ inputs.max-flaky-percent }}
+        FB_QUARANTINE_DAYS: ${{ inputs.quarantine-days }}
+        FB_QUARANTINE_EXPIRY: ${{ inputs.quarantine-expiry }}
+      run: |
+        args=(--min-runs="$FB_MIN_RUNS")
+        if [ "${FB_MAX_FLAKY_PERCENT:+set}" = set ]; then
+          args+=(--max-flaky-percent="$FB_MAX_FLAKY_PERCENT")
+        fi
+        if [ "${FB_QUARANTINE_DAYS:+set}" = set ]; then
+          args+=(--quarantine-days="$FB_QUARANTINE_DAYS" --quarantine-expiry="$FB_QUARANTINE_EXPIRY")
+        fi
+        if ! python3 -m flakebox report "${args[@]}" > /dev/null; then
+          echo "::error::flakebox: the flake budget or the quarantine age limit is not met (details above)"
+          exit 1
+        fi
 
     - name: Fail on new flakes (optional)
       if: inputs.fail-on-flaky == 'true' && steps.report.outputs.new_flaky != '0'
@@ -177,4 +282,4 @@ runs:
       if: always()
       with:
         path: ~/.flakebox/history.db
-        key: ${{ inputs.db-key }}-${{ github.job }}-${{ github.ref }}-${{ github.run_id }}
+        key: ${{ inputs.db-key }}-${{ github.job }}-${{ github.ref }}-${{ github.run_id }}-${{ github.run_attempt }}

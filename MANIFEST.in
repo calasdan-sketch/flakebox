@@ -1,1 +1,5 @@
+include SECURITY.md
 include action.yml
+include CHANGELOG.md
+recursive-include tests *.py
+recursive-include tests *.xml *.txt

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from . import _depth as depth_mod
 import math
 import os
 import sqlite3
@@ -37,20 +38,39 @@ CREATE TABLE IF NOT EXISTS quarantine (
 EXPORT_FORMAT = 1
 
 
+class _Connection(sqlite3.Connection):
+    """close() first folds the WAL file back into the database, so a cache
+    that saves only history.db (a CI cache, an artifact) is complete."""
+
+    def close(self) -> None:
+        try:
+            if not getattr(self, "_flakebox_memory", False):
+                self.commit()
+                self.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass            # busy or read-only: closing must still happen
+        super().close()
+
+
 def connect(db_path: str) -> sqlite3.Connection:
     """Open (creating/migrating as needed). A file that is not a SQLite
     database raises sqlite3.DatabaseError - the CLI turns that into a
     clean error exit."""
     if db_path != ":memory:":
         os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.executescript(SCHEMA)
-    _migrate(conn)
-    # concurrent writers on stock SQLite: wait instead of immediately
-    # raising "database is locked", and use WAL so readers don't block
-    # writers (no-op on :memory:, which has no journal file).
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn = sqlite3.connect(db_path, factory=_Connection)
+    conn._flakebox_memory = db_path == ":memory:"
+    try:
+        conn.executescript(SCHEMA)
+        _migrate(conn)
+        # concurrent writers on stock SQLite: wait instead of immediately
+        # raising "database is locked", and use WAL so readers don't block
+        # writers (no-op on :memory:, which has no journal file).
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=WAL")
+    except BaseException:
+        conn.close()    # a file that is not a database must not leak a handle
+        raise
     return conn
 
 
@@ -188,6 +208,17 @@ def quarantine_add(conn: sqlite3.Connection, test_id: str,
 def quarantine_remove(conn: sqlite3.Connection, test_id: str) -> None:
     conn.execute("DELETE FROM quarantine WHERE test_id = ?", (test_id,))
     conn.commit()
+
+
+def quarantine_touch(conn: sqlite3.Connection, test_id: str,
+                     at: int | None = None) -> bool:
+    """Restart a quarantine's clock (it was looked at again and stays).
+    Returns False when the test is not quarantined."""
+    cur = conn.execute("UPDATE quarantine SET quarantined_at = ? "
+                       "WHERE test_id = ?",
+                       (int(time.time()) if at is None else int(at), test_id))
+    conn.commit()
+    return cur.rowcount == 1
 
 
 def quarantined(conn: sqlite3.Connection) -> list[dict]:
@@ -357,7 +388,27 @@ def import_file(conn: sqlite3.Connection, path: str) -> dict:
     deeper than the parser can follow included)."""
     with open(path, encoding="utf-8") as f:
         try:
-            data = json.load(f)
+            data = depth_mod.loads(f.read())
         except RecursionError:
             raise ValueError("nested too deeply") from None
     return import_data(conn, data)
+
+
+def prune(conn: sqlite3.Connection, keep_runs: int) -> dict:
+    """Delete all but the newest `keep_runs` runs and their results.
+    Quarantine entries stay. {"runs_removed", "results_removed", "kept"}."""
+    keep = max(int(keep_runs), 0)
+    ids = recent_run_ids(conn, keep)
+    marks = ",".join("?" * len(ids)) or "NULL"
+    old = [r[0] for r in conn.execute(
+        f"SELECT id FROM runs WHERE id NOT IN ({marks})", ids)]
+    removed = 0
+    for i in range(0, len(old), 500):
+        chunk = old[i:i + 500]
+        q = ",".join("?" * len(chunk))
+        cur = conn.execute(f"DELETE FROM results WHERE run_id IN ({q})", chunk)
+        removed += cur.rowcount
+        conn.execute(f"DELETE FROM runs WHERE id IN ({q})", chunk)
+    conn.commit()
+    return {"runs_removed": len(old), "results_removed": removed,
+            "kept": len(ids)}

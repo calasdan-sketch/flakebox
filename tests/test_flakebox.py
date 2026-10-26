@@ -625,7 +625,9 @@ class TestActionShellInjection(unittest.TestCase):
         carriers = 0
         for s in self.run_steps():
             # the env entries that carry an expression into the script
-            names = {k for k, v in s["env"].items() if "${{" in v}
+            # PYTHONPATH is read by python itself, not by the script
+            names = {k for k, v in s["env"].items()
+                     if "${{" in v and k != "PYTHONPATH"}
             carriers += len(names)
             for name in names:
                 self.assertRegex(s["run"], r"\$\{?" + name + r"\b",
@@ -647,14 +649,14 @@ class TestActionShellInjection(unittest.TestCase):
         write_raw(tmp, "shim.py", (
             "import json, os, sys\n"
             "tool, argv = sys.argv[1], sys.argv[2:]\n"
-            "if tool == 'pip' or argv[:2] == ['-m', 'flakebox']:\n"
+            "if argv[:2] in (['-m', 'pip'], ['-m', 'flakebox']):\n"
             "    with open(os.environ['FB_SHIM_LOG'], 'a', encoding='utf-8') as f:\n"
             "        f.write(json.dumps([tool] + argv) + '\\n')\n"
             "    if 'json' in argv:\n"
             "        print('{\"flaky\": [], \"quarantined\": [], \"new\": []}')\n"
             "    sys.exit(0)\n"
             "os.execv(sys.executable, [sys.executable] + argv)\n"))
-        for tool in ("python3", "pip"):
+        for tool in ("python3",):
             shim = os.path.join(shims, tool)
             write_raw(shims, tool, "#!/bin/sh\nexec %s %s %s \"$@\"\n" % (
                 shlex.quote(sys.executable), shlex.quote(shim_py), tool))
@@ -668,7 +670,10 @@ class TestActionShellInjection(unittest.TestCase):
             context = {e: value for e in (
                 "inputs.junit", "inputs.min-runs", "inputs.quarantine-output",
                 "inputs.export-output", "github.sha", "github.ref_name",
-                "github.action_path", "steps.report.outputs.new_flaky")}
+                "github.action_path", "steps.report.outputs.new_flaky",
+                "inputs.summary", "inputs.comment-output",
+                "inputs.max-flaky-percent", "inputs.quarantine-days",
+                "inputs.quarantine-expiry")}
             for step in self.run_steps():
                 env = {"PATH": shims + os.pathsep + os.environ.get("PATH", ""),
                        "HOME": _fake_home, "FB_SHIM_LOG": log,
@@ -694,7 +699,9 @@ class TestActionShellInjection(unittest.TestCase):
                 calls = [json.loads(ln) for ln in f.read().splitlines()]
             # every hostile string arrived as exactly one argument
             self.assertEqual(calls, [
-                ["pip", "install", value],
+                ["python3", "-m", "flakebox", "--version"],
+                ["python3", "-m", "flakebox", "summary", f"--junit={value}",
+                 f"--min-runs={value}"],
                 ["python3", "-m", "flakebox", "record", f"--junit={value}",
                  f"--commit={value}", f"--branch={value}"],
                 ["python3", "-m", "flakebox", "report", f"--min-runs={value}"],
@@ -702,7 +709,11 @@ class TestActionShellInjection(unittest.TestCase):
                  f"--min-runs={value}"],
                 ["python3", "-m", "flakebox", "quarantine", "--format", "json",
                  f"--min-runs={value}"],
-                ["python3", "-m", "flakebox", "export", f"--out={value}"]],
+                ["python3", "-m", "flakebox", "export", f"--out={value}"],
+                ["python3", "-m", "flakebox", "report", f"--min-runs={value}",
+                 f"--max-flaky-percent={value}",
+                 f"--quarantine-days={value}",
+                 f"--quarantine-expiry={value}"]],
                 f"for {value!r}")
             with open(output, encoding="utf-8") as f:
                 self.assertEqual(f.read(), "new_flaky=0\n")
@@ -779,7 +790,8 @@ class TestActionOptionValues(unittest.TestCase):
         os.chmod(os.path.join(shims, "python3"), 0o755)
         write_raw(work, "-report.xml", JUNIT)
         context = {"inputs.junit": "-report.xml", "github.sha": "-c0ffee",
-                   "github.ref_name": "-x", "inputs.export-output": "-out.json"}
+                   "github.ref_name": "-x", "inputs.export-output": "-out.json",
+                   "github.action_path": REPO}
         steps = {s["name"]: s for s in action_steps(action_text())}
 
         def run(name: str):
@@ -1543,7 +1555,8 @@ def reference_analyze(conn, min_runs=5, stable_runs=10, window=50,
             continue
         last_run = seen[0][1]
         outcomes = [o for _, _, o in seen]
-        passes = sum(1 for o in outcomes if o == "passed")
+        retries = sum(1 for o in outcomes if o == "retried")
+        passes = sum(1 for o in outcomes if o in ("passed", "retried"))
         fails = sum(1 for o in outcomes if o in ("failed", "error"))
         skips = sum(1 for o in outcomes if o == "skipped")
         streak = 0
@@ -1553,11 +1566,13 @@ def reference_analyze(conn, min_runs=5, stable_runs=10, window=50,
             elif o != "skipped":
                 break
         executed = passes + fails
-        status = ("flaky" if passes and fails else "failing" if fails
+        status = ("flaky" if (passes and fails) or retries
+                  else "failing" if fails
                   else "passing" if passes else "unknown")
         s = {"runs": executed, "recorded": len(outcomes), "passes": passes,
              "failures": fails, "skips": skips,
-             "flake_rate": (fails / executed) if executed else 0.0,
+             "retries": retries,
+             "flake_rate": ((fails + retries) / executed) if executed else 0.0,
              "pass_streak": streak, "status": status, "test_id": tid,
              "quarantined": store_mod.is_quarantined(conn, tid)}
         if recent and last_run not in recent:
@@ -1568,7 +1583,7 @@ def reference_analyze(conn, min_runs=5, stable_runs=10, window=50,
             retired.append(s)
             continue
         s["retired"] = False
-        if executed < min_runs:
+        if executed < min_runs and not retries:
             continue
         recovered = streak >= stable_runs
         if status == "flaky" and not recovered:
@@ -1581,7 +1596,9 @@ def reference_analyze(conn, min_runs=5, stable_runs=10, window=50,
     broken.sort(key=lambda s: -s["failures"])
     retired.sort(key=lambda s: (rank[s["last_run"]], s["test_id"]))
     return {"flaky": flaky, "broken": broken, "stable": stable,
-            "retired": retired}
+            "retired": retired,
+            "totals": detect_mod.totals(len(all_ids) - len(retired),
+                                        len(flaky))}
 
 
 EQUIVALENCE_QUARANTINED = (3, 37, 66, 99, 121, 130, 140)
@@ -1714,7 +1731,7 @@ def verdicts(analysis: dict) -> dict:
     on the order the runs arrived in) - what must not depend on it."""
     return {bucket: {s["test_id"]: {k: v for k, v in s.items() if k != "last_run"}
                      for s in analysis[bucket]}
-            for bucket in analysis}
+            for bucket in analysis if bucket != "totals"}
 
 
 class TestRecencyOrder(unittest.TestCase):
@@ -2500,8 +2517,9 @@ class TestDbFlagPosition(unittest.TestCase):
         self.assertIn("--db works before or after the subcommand", parser.format_help())
         subs = next(a for a in parser._actions
                     if isinstance(a, argparse_sub_type())).choices
-        self.assertEqual(sorted(subs), ["export", "history", "import", "quarantine",
-                                        "record", "report", "unquarantine"])
+        self.assertEqual(sorted(subs), ["export", "history", "import", "prune", "quarantine",
+                                        "record", "report", "retriage",
+                                        "summary", "unquarantine"])
         for name, sub in subs.items():
             self.assertIn("--db", sub.format_help(), name)
 
@@ -4112,3 +4130,93 @@ class TestDeselectLineEnding(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Round 9 fixes.
+# ---------------------------------------------------------------------------
+
+
+class TestRound9(unittest.TestCase):
+    def junit(self, cases):
+        body = "".join(cases)
+        return ("<testsuite>" + body + "</testsuite>").encode()
+
+    def test_duplicate_testcase_collapses_to_worst_outcome(self):
+        raw = self.junit([
+            '<testcase classname="a.B" name="t" time="1"/>',
+            '<testcase classname="a.B" name="t" time="2"><failure message="x"/></testcase>',
+            '<testcase classname="a.B" name="t" time="1"/>',
+            '<testcase classname="a.B" name="u"/>'])
+        res = junit_mod.parse_bytes(raw)
+        self.assertEqual([r["test_id"] for r in res], ["a.B::t", "a.B::u"])
+        # fail, then pass again: the last attempt passed, so the build is
+        # green and the test flaked -- recorded as a retry-pass
+        self.assertEqual(res[0]["outcome"], "retried")
+        self.assertEqual(res[0]["message"], "x")
+        self.assertEqual(res[0]["duration_ms"], 2000)
+
+    def test_duplicate_error_beats_failure_and_skip_loses_to_pass(self):
+        raw = self.junit([
+            '<testcase name="e"><failure message="f"/></testcase>',
+            '<testcase name="e"><error message="boom"/></testcase>',
+            '<testcase name="s"><skipped/></testcase>',
+            '<testcase name="s"/>'])
+        res = {r["test_id"]: r["outcome"] for r in junit_mod.parse_bytes(raw)}
+        self.assertEqual(res, {"e": "error", "s": "passed"})
+
+    def test_duplicates_in_one_report_count_as_one_run(self):
+        tmp = mktemp()
+        rep = os.path.join(tmp, "r.xml")
+        with open(rep, "wb") as f:
+            f.write(self.junit(['<testcase name="t"/>', '<testcase name="t"/>']))
+        db = os.path.join(tmp, "h.db")
+        code, out, _ = run_cli("--db", db, "record", "--junit", rep)
+        self.assertEqual(code, 0)
+        self.assertIn("1 tests", out)
+
+    def test_min_runs_below_one_is_rejected_with_exit_2(self):
+        for bad in ("0", "-3"):
+            for sub in ("report", "quarantine"):
+                err = io.StringIO()
+                with redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                    cli_mod.main(["--db", os.path.join(mktemp(), "h.db"),
+                                  sub, "--min-runs", bad])
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("--min-runs", err.getvalue())
+
+    def test_min_runs_one_is_accepted(self):
+        code, _, _ = run_cli("--db", os.path.join(mktemp(), "h.db"),
+                             "report", "--format", "json", "--min-runs", "1")
+        self.assertEqual(code, 0)
+
+    def test_unquarantine_hint_says_only_when_stable(self):
+        tmp = mktemp()
+        db = os.path.join(tmp, "h.db")
+        code, out, _ = run_cli("--db", db, "unquarantine", "--test", "a::b")
+        self.assertEqual(code, 0)
+        self.assertIn("only when it is stable now", out)
+
+    def test_action_installs_with_the_interpreter_it_runs_and_save_key_has_attempt(self):
+        text = action_text()
+        # no pip at all (PEP 668 systems refuse it): the action runs the
+        # package from its own checkout, PYTHONPATH set per step
+        self.assertNotIn("pip install", text.replace("`pip install`", ""))
+        self.assertNotIn("-m pip", text)
+        save = text[text.index("Save flakebox history"):]
+        self.assertIn("github.run_attempt", save)
+
+    def test_metadata_and_workflows_present(self):
+        with open(os.path.join(REPO, "pyproject.toml"), encoding="utf-8") as f:
+            py = f.read()
+        for needle in ("Calas Automations Inc.", "Framework :: Pytest",
+                       "Development Status :: 4 - Beta", "Python :: 3.14",
+                       "[project.urls]", "Issues ="):
+            self.assertIn(needle, py)
+        wf = os.path.join(REPO, *(".github", "workflows"))
+        if os.path.isdir(wf):       # not shipped in the sdist
+            with open(os.path.join(wf, "release.yml"), encoding="utf-8") as f:
+                rel = f.read()
+            self.assertIn("id-token: write", rel)
+            self.assertEqual(rel.count("id-token: write"), 1)
+            self.assertIn("pypa/gh-action-pypi-publish", rel)
