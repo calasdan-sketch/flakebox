@@ -1,0 +1,60 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # pytest is needed by the tests that drive the generated quarantine
+      # plugin; without it they skip, so install it (flakebox itself needs
+      # nothing).
+      - run: python -m pip install pytest
+      - name: Install flakebox and smoke-test the console script
+        run: |
+          python -m pip install .
+          flakebox --version
+      - run: python -m unittest discover -s tests
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install build twine
+      - run: python -m build
+      - run: python -m twine check --strict dist/*
+      - name: Install the wheel in a clean venv and run the CLI
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/venv/bin/flakebox" --version
+      # What PyPI users get as the source distribution must carry and pass
+      # its own tests: unpack it, install it in a clean venv, run the suite.
+      - name: Run the tests from the sdist
+        run: |
+          set -e
+          mkdir "$RUNNER_TEMP/sdist"
+          tar -xzf dist/*.tar.gz -C "$RUNNER_TEMP/sdist" --strip-components=1
+          python -m venv "$RUNNER_TEMP/sdist-venv"
+          "$RUNNER_TEMP/sdist-venv/bin/python" -m pip install pytest dist/*.tar.gz
+          cd "$RUNNER_TEMP/sdist"
+          "$RUNNER_TEMP/sdist-venv/bin/python" -m unittest discover -s tests
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
