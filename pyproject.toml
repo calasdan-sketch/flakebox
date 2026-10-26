@@ -21,7 +21,6 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
-    "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
     "Environment :: Console",
     "Topic :: Software Development :: Testing",
@@ -34,3 +33,6 @@ Changelog = "https://github.com/calasdan-sketch/flakebox/blob/main/CHANGELOG.md"
 flakebox = "flakebox.cli:main"
 [tool.setuptools]
 packages = ["flakebox"]
+
+[tool.setuptools.package-data]
+flakebox = ["py.typed"]

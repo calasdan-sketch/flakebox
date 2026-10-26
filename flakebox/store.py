@@ -38,13 +38,28 @@ CREATE TABLE IF NOT EXISTS quarantine (
 EXPORT_FORMAT = 1
 
 
+class _Connection(sqlite3.Connection):
+    """close() first folds the WAL file back into the database, so a cache
+    that saves only history.db (a CI cache, an artifact) is complete."""
+
+    def close(self) -> None:
+        try:
+            if not getattr(self, "_flakebox_memory", False):
+                self.commit()
+                self.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass            # busy or read-only: closing must still happen
+        super().close()
+
+
 def connect(db_path: str) -> sqlite3.Connection:
     """Open (creating/migrating as needed). A file that is not a SQLite
     database raises sqlite3.DatabaseError - the CLI turns that into a
     clean error exit."""
     if db_path != ":memory:":
         os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, factory=_Connection)
+    conn._flakebox_memory = db_path == ":memory:"
     try:
         conn.executescript(SCHEMA)
         _migrate(conn)
@@ -377,3 +392,23 @@ def import_file(conn: sqlite3.Connection, path: str) -> dict:
         except RecursionError:
             raise ValueError("nested too deeply") from None
     return import_data(conn, data)
+
+
+def prune(conn: sqlite3.Connection, keep_runs: int) -> dict:
+    """Delete all but the newest `keep_runs` runs and their results.
+    Quarantine entries stay. {"runs_removed", "results_removed", "kept"}."""
+    keep = max(int(keep_runs), 0)
+    ids = recent_run_ids(conn, keep)
+    marks = ",".join("?" * len(ids)) or "NULL"
+    old = [r[0] for r in conn.execute(
+        f"SELECT id FROM runs WHERE id NOT IN ({marks})", ids)]
+    removed = 0
+    for i in range(0, len(old), 500):
+        chunk = old[i:i + 500]
+        q = ",".join("?" * len(chunk))
+        cur = conn.execute(f"DELETE FROM results WHERE run_id IN ({q})", chunk)
+        removed += cur.rowcount
+        conn.execute(f"DELETE FROM runs WHERE id IN ({q})", chunk)
+    conn.commit()
+    return {"runs_removed": len(old), "results_removed": removed,
+            "kept": len(ids)}

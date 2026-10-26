@@ -185,9 +185,17 @@ def is_retry_pass(attempts: list[str]) -> bool:
     return any(a in (FAILED, ERROR) for a in ran[:-1])
 
 
-def read(path: str) -> bytes:
+def read(path: str, max_bytes: int | None = None) -> bytes:
+    """The whole file. With `max_bytes` a larger file is a ValueError instead
+    of an out-of-memory crash (the cap is checked while reading)."""
     with open(path, "rb") as f:
-        return f.read()
+        if max_bytes is None:
+            return f.read()
+        raw = f.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError(f"the report is larger than {max_bytes // 2**20} MB "
+                         f"(--max-report-mb)")
+    return raw
 
 
 def parse(path: str, warn=_warn) -> list[dict]:

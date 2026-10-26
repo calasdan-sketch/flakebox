@@ -2517,7 +2517,7 @@ class TestDbFlagPosition(unittest.TestCase):
         self.assertIn("--db works before or after the subcommand", parser.format_help())
         subs = next(a for a in parser._actions
                     if isinstance(a, argparse_sub_type())).choices
-        self.assertEqual(sorted(subs), ["export", "history", "import", "quarantine",
+        self.assertEqual(sorted(subs), ["export", "history", "import", "prune", "quarantine",
                                         "record", "report", "retriage",
                                         "summary", "unquarantine"])
         for name, sub in subs.items():

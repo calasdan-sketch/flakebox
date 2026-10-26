@@ -213,3 +213,80 @@ def deselect_line(test_ids: list[str]) -> str:
     if os.name == "nt":
         return subprocess.list2cmdline(args)
     return shlex.join(args)
+
+
+# --- other runners (best effort) -------------------------------------------
+# These turn the quarantine set into a command-line option for runners that
+# have no plugin of ours. They match by TEST NAME only, so two tests that
+# share a name in different files are both skipped, and a renamed test is not.
+
+_JS_SPECIAL = set("\\.*+?^${}()|[]/")
+_RE2_SPECIAL = set("\\.*+?^${}()|[]")
+
+
+def _escape(text: str, special: set) -> str:
+    return "".join("\\" + c if c in special else c for c in text)
+
+
+def _quote_args(args: list[str]) -> str:
+    return subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
+
+
+def js_names(test_ids: list[str], vitest: bool = False) -> list[str]:
+    """Full test names (describe blocks and test title joined by a space, the
+    text `-t` matches) from jest-junit ids (`full name::full name`) or
+    vitest ids (`file::suite > test`)."""
+    names = set()
+    for tid in test_ids:
+        left, sep, right = tid.partition("::")
+        if vitest:
+            name = (right if sep else left).replace(" > ", " ")
+        else:
+            name = left
+        name = name.strip()
+        if name:
+            names.add(name)
+    return sorted(names)
+
+
+def _not_these(names: list[str], special: set) -> str:
+    alt = "|".join(_escape(n, special) for n in names)
+    return f"^(?!(?:{alt})$)"
+
+
+def jest_line(test_ids: list[str], vitest: bool = False) -> str:
+    """`--testNamePattern '<regex>'` (jest) or `-t '<regex>'` (vitest) that
+    runs everything EXCEPT the quarantined names: a negative lookahead on
+    the full test name. Empty when nothing is quarantined."""
+    names = js_names(test_ids, vitest)
+    if not names:
+        return ""
+    flag = "-t" if vitest else "--testNamePattern"
+    return _quote_args([flag, _not_these(names, _JS_SPECIAL)])
+
+
+def go_names(test_ids: list[str]) -> tuple[list[str], int]:
+    """(top-level test names, number of subtests that could not be
+    expressed). `go test -skip` takes ONE pattern split on `/` per level, so
+    a list of subtests under different parents cannot be written; their
+    parents are not skipped (that would hide the healthy subtests)."""
+    top, subs = set(), 0
+    for tid in test_ids:
+        name = tid.partition("::")[2] if "::" in tid else tid
+        name = name.strip()
+        if not name:
+            continue
+        if "/" in name:
+            subs += 1
+        else:
+            top.add(name)
+    return sorted(top), subs
+
+
+def go_line(test_ids: list[str]) -> str:
+    """`-skip '^(TestA|TestB)$'` for `go test` (Go 1.20 or newer)."""
+    names, _ = go_names(test_ids)
+    if not names:
+        return ""
+    alt = "|".join(_escape(n, _RE2_SPECIAL) for n in names)
+    return _quote_args(["-skip", f"^({alt})$"])

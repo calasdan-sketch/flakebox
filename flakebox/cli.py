@@ -24,6 +24,7 @@ import os
 import sqlite3
 import sys
 
+from . import __version__
 from . import cost as cost_mod
 from . import detect as detect_mod
 from . import junit as junit_mod
@@ -31,7 +32,7 @@ from . import quarantine as quar_mod
 from . import store as store_mod
 from . import summary as summary_mod
 
-VERSION = "0.5.0"
+VERSION = __version__
 
 
 def default_db() -> str:
@@ -115,7 +116,7 @@ def _is_cwd(path: str) -> bool:
 
 def cmd_record(args) -> int:
     try:
-        raw = junit_mod.read(args.junit)
+        raw = junit_mod.read(args.junit, _report_cap(args))
         results = junit_mod.parse_bytes(raw, args.junit)
     except FileNotFoundError:
         print(f"error: no such file: {args.junit}", file=sys.stderr)
@@ -151,6 +152,11 @@ def cmd_record(args) -> int:
     print(f"recorded run {run_id}: {len(results)} tests, "
           f"{n_fail} failed/error{extra}")
     return 0
+
+
+def _report_cap(args) -> int | None:
+    mb = getattr(args, "max_report_mb", DEFAULT_MAX_REPORT_MB)
+    return int(mb * 2**20) if mb else None
 
 
 def _pct(f: float) -> str:
@@ -218,6 +224,16 @@ def _analysis(args):
 def cmd_report(args) -> int:
     a, entries, est = _analysis(args)
     gates = evaluate_gates(args, a, entries)
+    if args.format == "html":
+        from . import html_report
+        conn = _db(args.db)
+        try:
+            page = html_report.render(conn, a)
+        finally:
+            conn.close()
+        _lf_only(sys.stdout)
+        sys.stdout.write(page)
+        return _gate_exit(gates)
     if args.format == "json":
         out = dict(a, cost=est, budget=gates["budget"],
                    expired=gates["expired"])
@@ -287,7 +303,7 @@ def cmd_summary(args) -> int:
     """Markdown for a PR comment or job summary about ONE report: which of
     its failures are known flakes and which are new. Run before `record`."""
     try:
-        raw = junit_mod.read(args.junit)
+        raw = junit_mod.read(args.junit, _report_cap(args))
         results = junit_mod.parse_bytes(raw, args.junit)
     except FileNotFoundError:
         print(f"error: no such file: {args.junit}", file=sys.stderr)
@@ -362,6 +378,22 @@ def cmd_quarantine(args) -> int:
         if not _is_cwd(out_dir):
             print(f"  ({out_dir} is not the current directory: put it on "
                   f"PYTHONPATH first, or python cannot import the plugin)")
+    elif args.format in ("jest", "vitest", "go"):
+        # like deselect: stdout holds only the option, the summary and any
+        # limit go to stderr
+        print(summary, file=sys.stderr)
+        _lf_only(sys.stdout)
+        if args.format == "go":
+            _, subs = quar_mod.go_names(full)
+            if subs:
+                print(f"note: {subs} quarantined subtest(s) cannot be "
+                      f"written for `go test -skip` and were left out",
+                      file=sys.stderr)
+            line = quar_mod.go_line(full)
+        else:
+            line = quar_mod.jest_line(full, vitest=args.format == "vitest")
+        if line:
+            print(line)
     elif args.format == "deselect":
         # stdout is meant for `eval "pytest $(flakebox quarantine --format
         # deselect)"`: only the (shell-quoted) args go there, the summary
@@ -372,6 +404,21 @@ def cmd_quarantine(args) -> int:
     else:
         print(json.dumps({"quarantined": full, "new": new}, indent=2))
     return _gate_exit(gates)
+
+
+def cmd_prune(args) -> int:
+    conn = _db(args.db)
+    try:
+        r = store_mod.prune(conn, args.keep_runs)
+        try:
+            conn.execute("VACUUM")
+        except sqlite3.Error:
+            pass
+    finally:
+        conn.close()
+    print(f"pruned {r['runs_removed']} run(s) ({r['results_removed']} "
+          f"results); kept the newest {r['kept']}. Quarantine is unchanged.")
+    return 0
 
 
 def cmd_unquarantine(args) -> int:
@@ -491,6 +538,21 @@ def _days(text: str) -> int:
     return n
 
 
+DEFAULT_MAX_REPORT_MB = 200
+
+
+def _mb(text: str) -> float:
+    """--max-report-mb: megabytes, 0 or more."""
+    try:
+        x = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid number: {text!r}") from None
+    if not 0 <= x <= 1_000_000:
+        raise argparse.ArgumentTypeError(f"must be between 0 and 1000000, got {text}")
+    return x
+
+
 def _percent(text: str) -> float:
     """--max-flaky-percent: a number from 0 to 100."""
     try:
@@ -549,7 +611,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="exit 1 when more than P percent of the "
                              "active tests are flaky (0-100; default: off)")
 
-    r = sub.add_parser("record", parents=[common],
+    limits = argparse.ArgumentParser(add_help=False)
+    limits.add_argument("--max-report-mb", type=_mb, default=DEFAULT_MAX_REPORT_MB,
+                        metavar="N",
+                        help="refuse a JUnit report larger than N MB "
+                             f"(default {DEFAULT_MAX_REPORT_MB}; 0 = no limit)")
+
+    r = sub.add_parser("record", parents=[common, limits],
                        help="Ingest a JUnit XML report.")
     r.add_argument("--junit", required=True)
     r.add_argument("--commit", type=_utf8, default=None)
@@ -565,12 +633,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     rp = sub.add_parser("report", parents=[common, detect, expiry, budget],
                         help="Flaky / broken / stable / retired tables.")
-    rp.add_argument("--format", choices=["markdown", "json"],
+    rp.add_argument("--format", choices=["markdown", "json", "html"],
                     default="markdown")
 
     q = sub.add_parser("quarantine", parents=[common, detect, expiry],
                        help="Quarantine the flaky set.")
-    q.add_argument("--format", choices=["pytest", "json", "deselect"],
+    q.add_argument("--format", choices=["pytest", "json", "deselect", "jest", "vitest",
+                                   "go"],
                    default="pytest")
     q.add_argument("-o", "--out", default=".",
                    help="Output dir for --format pytest.")
@@ -579,7 +648,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "skip them (default) or run them as non-strict "
                         "xfail so they keep recording results")
 
-    sm = sub.add_parser("summary", parents=[common, detect, expiry, budget],
+    sm = sub.add_parser("summary", parents=[common, detect, expiry, budget, limits],
                         help="Markdown for a PR comment or job summary: "
                              "which failures in a report are known flakes "
                              "and which are new (run before `record`).")
@@ -589,6 +658,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Keep a quarantined test and restart its "
                              "--quarantine-days clock.")
     rt.add_argument("--test", required=True, type=_utf8)
+
+    pr = sub.add_parser("prune", parents=[common],
+                        help="Delete old runs and their results; the "
+                             "quarantine list is kept.")
+    pr.add_argument("--keep-runs", required=True, type=_min_runs, metavar="N",
+                    help="keep the newest N runs")
 
     u = sub.add_parser("unquarantine", parents=[common], help="Release a test.")
     u.add_argument("--test", required=True, type=_utf8)
@@ -651,7 +726,7 @@ def main(argv=None) -> int:
     _harden_streams()
     args = build_parser().parse_args(argv)
     cmds = {"record": cmd_record, "report": cmd_report, "summary": cmd_summary,
-            "retriage": cmd_retriage,
+            "retriage": cmd_retriage, "prune": cmd_prune,
             "quarantine": cmd_quarantine, "unquarantine": cmd_unquarantine,
             "history": cmd_history, "export": cmd_export,
             "import": cmd_import}

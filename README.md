@@ -5,6 +5,8 @@ in every red build; flakebox ingests JUnit XML, detects flakiness
 statistically, quarantines the flakes, and tells you when they are stable
 enough to come back. SQLite, stdlib-only, no SaaS.
 
+**Limits:** It spots flaky tests from the test reports you feed it; it cannot fix a flake, and a test that never ran twice cannot be judged.
+
 ## Install
 
 Zero dependencies — Python 3.10+ stdlib only.
@@ -309,6 +311,39 @@ tested against reports written by the tools themselves
 | vitest | `reporters: ['junit']`, `outputFile` | ids are `file::suite > test`; a vitest `retry` writes only the final result |
 | Go | `gotestsum --junitfile report.xml` | `--rerun-fails` writes each rerun as another `<testcase>`: a failed one followed by a passed one is recorded as a retry-pass; a parent test fails whenever one of its subtests fails |
 
+### jest, vitest and Go: a skip option (best effort)
+
+`flakebox quarantine --format jest|vitest|go` prints one command-line option
+that makes the runner leave out the quarantined tests (the summary line goes to
+stderr, so `$(...)` captures only the option):
+
+| runner | output | how it is used |
+|---|---|---|
+| jest | `--testNamePattern '^(?!(?:name1\|name2)$)'` | `jest $(flakebox quarantine --format jest)` |
+| vitest | `-t '^(?!(?:...)$)'` | same, with `vitest run` |
+| Go (1.20+) | `-skip '^(TestA\|TestB)$'` | `go test -skip ...` |
+
+Limits, honestly: it matches by test **name**, so two tests with the same name
+in different files are both skipped; it needs the report's ids to be what the
+runner prints (jest-junit's default and vitest's `file::suite > test`); and
+`go test -skip` cannot express a list of subtests under different parents, so
+quarantined subtests are left out (stderr says how many). Quote the option
+for your shell as you would any argument with `(`, `|` or `$`.
+
+### Static trend page
+
+`flakebox report --format html > flakes.html` writes one self-contained page
+(no script, no network): failing results per run for the last 60 runs, and for
+each flaky test a strip of its last 40 outcomes.
+
+### Keeping the database small
+
+`flakebox prune --keep-runs N` deletes all but the newest N runs and their
+results (the quarantine list stays) and compacts the file. Every command that
+changes the database folds its write-ahead log back into `history.db` on exit,
+so caching only that one file is enough. `record` and `summary` refuse a JUnit
+report larger than `--max-report-mb` (default 200; 0 turns the limit off).
+
 ## GitHub Action
 
 `action.yml` is a composite action (Linux and macOS runners; it calls `python3` under bash): restores the DB from cache, records
@@ -366,6 +401,29 @@ on a GitHub-hosted runner is `github-actions[bot]`, shared with every other
 step that comments (pr-verify's, for one). If anything else comments on the
 pull request, drop `--edit-last --create-if-none` and accept one comment per
 push, or find your comment by the marker line yourself.
+
+A comment that is updated in place (instead of `--edit-last`, which edits
+whichever comment the bot wrote last) finds its own by the marker line:
+
+```yaml
+- if: github.event_name == 'pull_request'
+  env:
+    GH_TOKEN: ${{ github.token }}
+    PR: ${{ github.event.pull_request.number }}
+    REPO: ${{ github.repository }}
+  run: |
+    id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+      --jq '[.[] | select(.body | startswith("<!-- flakebox:summary -->"))][0].id // empty')
+    if [ "$id" ]; then
+      gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@flakebox/comment.md
+    else
+      gh pr comment "$PR" --body-file flakebox/comment.md
+    fi
+```
+
+Anyone can paste the marker into a comment of their own; this takes the first
+one that starts with it. On a repository where that matters, also check the
+comment's author (`.user.login == "github-actions[bot]"` in the `--jq`).
 
 **The acknowledgement loop.** The history DB lives in the CI cache, where
 nobody can run `flakebox quarantine` by hand — so on its own,
@@ -434,7 +492,7 @@ and prove `import flakebox` works with `yaml` blocked). Tests point
 `HOME`/`USERPROFILE`/`APPDATA` at a throwaway directory, so they never
 touch your real `~/.flakebox`. A few tests drive real `pytest` as a
 subprocess to prove the mapped `--deselect` ids and the generated plugin
-work on parametrised ids (skipped when pytest is not installed). Runs on Windows 11: stdout/stderr are
+work on parametrised ids (skipped when pytest is not installed). The CI matrix runs the suite on ubuntu-latest, windows-latest and macos-latest. stdout/stderr are
 reconfigured to replace unencodable characters (the report's emoji on a
 cp1252 console), and every text file is opened as UTF-8.
 
