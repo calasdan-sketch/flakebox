@@ -1,8 +1,8 @@
 # Flakebox (`flakebox`)
 
-Self-hosted flaky-test triage for small teams. Flaky tests eat 10–25% of
-CI compute and erode trust in every red build. Trunk and Datadog will sell
-you the fix per-seat; flakebox is the free, self-hosted alternative:
+Self-hosted flaky-test triage for small teams. Flaky tests waste CI time and erode
+trust in every red build. Hosted services (for example Trunk Flaky Tests)
+solve this as a service; flakebox is the free, self-hosted alternative:
 ingest JUnit XML, detect flakiness statistically, quarantine the flakes,
 and get told when they're stable enough to come back. SQLite, stdlib-only,
 no SaaS.
@@ -12,9 +12,11 @@ no SaaS.
 Zero dependencies — Python 3.10+ stdlib only.
 
 ```bash
-pip install git+https://github.com/calasdan-sketch/flakebox
+pip install flakebox
 flakebox --version
 ```
+
+Source and issues: https://github.com/calasdan-sketch/flakebox
 
 ## Usage
 

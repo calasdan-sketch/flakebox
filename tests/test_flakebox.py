@@ -2514,7 +2514,7 @@ class TestDocsAndDeadCode(unittest.TestCase):
     def test_readme_is_truthful(self):
         with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
             readme = f.read()
-        self.assertIn("pip install git+https://github.com/calasdan-sketch/flakebox", readme)
+        self.assertIn("pip install flakebox", readme)
         self.assertNotIn("git clone <repo>", readme)
         self.assertNotRegex(readme, r"(?m)^\s*#?\s*(?:or: )?alias ")
         # a hard-coded test count goes stale with the next test (it said
@@ -3158,7 +3158,9 @@ class TestPrintedPytestCommand(unittest.TestCase):
             proc = run_pytest_argv(tmp, argv + ["-p", "flakebox_quarantine"])
             self.assertNotEqual(proc.returncode, 0, argv)
             self.assertIn("flakebox_quarantine", proc.stdout + proc.stderr)
-            self.assertIn("ImportError", proc.stdout + proc.stderr)
+            out = proc.stdout + proc.stderr
+            # older pytest prints the ImportError, newer prints only its message
+            self.assertTrue("ImportError" in out or "No module named" in out, out)
 
     def test_no_documentation_shows_the_bare_command(self):
         bare = re.compile(r"(?<!-m )pytest -p flakebox_quarantine")

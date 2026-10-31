@@ -1,4 +1,4 @@
-"""Windows reports a reader that has gone away as OSError(EINVAL) out of the
+﻿"""Windows reports a reader that has gone away as OSError(EINVAL) out of the
 flush -- not as BrokenPipeError -- and fails a second time at interpreter
 exit (status 120) unless fd 1 was pointed at the null device first. These
 tests reproduce that on any OS. The real-pipe subprocess tests elsewhere in
@@ -54,7 +54,7 @@ class TestWindowsClosedPipe(unittest.TestCase):
                 mock.patch.object(cli_mod, "_broken_pipe", lambda: (gone.append(1), 0)[1]), \
                 mock.patch.object(sys, "stdout", _DeadPipe(exc)):
             with mock.patch.object(cli_mod, "cmd_report", lambda a: print("hello") or 0):
-                rc = cli_mod.main(["report"])
+                rc = cli_mod.main(["report"])  # noqa: F841
         return rc, gone
 
     def test_einval_out_of_the_flush_is_a_quiet_exit_on_windows(self):
@@ -86,7 +86,7 @@ class TestWindowsClosedPipe(unittest.TestCase):
                 mock.patch.object(cli_mod, "_broken_pipe", lambda: (gone.append(1), 0)[1]), \
                 mock.patch.object(sys, "stdout", _DeadPipe(exc)):
             with mock.patch.object(cli_mod, "cmd_report", lambda a: print("hello") or 0):
-                rc = cli_mod.main(["report"])
+                rc = cli_mod.main(["report"])  # noqa: F841
 
 
 if __name__ == "__main__":

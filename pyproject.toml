@@ -3,19 +3,34 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 [project]
 name = "flakebox"
-version = "0.4.4"
+version = "0.4.5"
 description = "Self-hosted flaky-test triage for small teams."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
+keywords = ["flaky tests", "pytest", "junit", "ci", "quarantine", "sqlite"]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Environment :: Console",
     "Topic :: Software Development :: Testing",
 ]
+[project.urls]
+Homepage = "https://github.com/calasdan-sketch/flakebox"
+Issues = "https://github.com/calasdan-sketch/flakebox/issues"
+
 [project.scripts]
 flakebox = "flakebox.cli:main"
 [tool.setuptools]
 packages = ["flakebox"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+ignore = ["E731"]

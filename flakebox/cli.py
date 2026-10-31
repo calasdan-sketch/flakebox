@@ -1,4 +1,4 @@
-"""Flakebox: self-hosted flaky-test triage for small teams.
+﻿"""Flakebox: self-hosted flaky-test triage for small teams.
 
 Ingests JUnit XML, detects flakiness statistically, quarantines the
 flakes, and tells you when they're stable enough to come back.
@@ -28,7 +28,7 @@ from . import junit as junit_mod
 from . import quarantine as quar_mod
 from . import store as store_mod
 
-VERSION = "0.4.4"
+VERSION = "0.4.5"
 
 
 def default_db() -> str:
