@@ -160,6 +160,13 @@ def db_from_outcomes(tmp: str, series: dict) -> str:
     return db
 
 
+def empty_db(path: str) -> str:
+    """Create an empty flakebox DB at `path` (read commands refuse a
+    missing one since 0.5.0) and return the path."""
+    store_mod.connect(path).close()
+    return path
+
+
 def run_cli(*argv) -> tuple:
     out, err = io.StringIO(), io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
@@ -544,7 +551,7 @@ class TestActionYml(unittest.TestCase):
 
     def test_min_runs_input_feeds_a_valid_int(self):
         default = flat_yaml(action_text())["inputs"]["min-runs"]["default"]
-        code, out, _ = run_cli("--db", os.path.join(mktemp(), "h.db"),
+        code, out, _ = run_cli("--db", empty_db(os.path.join(mktemp(), "h.db")),
                                "report", "--format", "json",
                                "--min-runs", default)
         self.assertEqual(code, 0)
@@ -1518,8 +1525,35 @@ class TestStorePragmas(unittest.TestCase):
             conn.close()
 
 
+def _reference_signature(message):
+    """Independent re-statement of detect.failure_signature()."""
+    lines = [ln for ln in (message or "").split("\n") if ln.strip()]
+    if not lines:
+        return "(no message)"
+    out, i, line = [], 0, lines[0]
+    while i < len(line):
+        if line.startswith("0x", i) and i + 2 < len(line) and \
+                line[i + 2] in "0123456789abcdefABCDEF":
+            i += 2
+            while i < len(line) and line[i] in "0123456789abcdefABCDEF":
+                i += 1
+            out.append("N")
+        elif line[i].isdigit() and line[i].isascii():
+            while i < len(line) and (
+                    (line[i].isdigit() and line[i].isascii())
+                    or (line[i] in ".," and i + 1 < len(line)
+                        and line[i + 1].isdigit() and line[i + 1].isascii())):
+                i += 1
+            out.append("N")
+        else:
+            out.append(line[i])
+            i += 1
+    sig = " ".join("".join(out).split())
+    return sig[:160] if sig else "(no message)"
+
+
 def reference_analyze(conn, min_runs=5, stable_runs=10, window=50,
-                      retire_after=3):
+                      retire_after=3, use_commits=True):
     """Independent per-test (N+1) implementation of the detection rules
     (see detect.py's docstring), kept as the oracle for the batched
     analyze(): same classification, same counts, same order. Recency is
@@ -1531,53 +1565,79 @@ def reference_analyze(conn, min_runs=5, stable_runs=10, window=50,
         conn.execute("SELECT id, created_at FROM runs").fetchall(),
         key=lambda r: (never if r[1] is None else r[1], r[0]), reverse=True)
     rank = {run_id: n for n, (run_id, _) in enumerate(newest_first)}
+    commit_of = dict(conn.execute("SELECT id, commit_sha FROM runs"))
     recent = [run_id for run_id, _ in newest_first[:max(retire_after, 0)]]
     all_ids = [r[0] for r in conn.execute(
         "SELECT DISTINCT test_id FROM results ORDER BY rowid")]
     for tid in all_ids:
-        seen = sorted((rank[run_id], run_id, outcome) for run_id, outcome in
-                      conn.execute("SELECT run_id, outcome FROM results "
-                                   "WHERE test_id = ?", (tid,))
+        seen = sorted((rank[run_id], run_id, outcome, msg)
+                      for run_id, outcome, msg in
+                      conn.execute("SELECT run_id, outcome, message "
+                                   "FROM results WHERE test_id = ?", (tid,))
                       if run_id in rank)[:max(window, 0)]  # newest first
         if not seen:
             continue
         last_run = seen[0][1]
-        outcomes = [o for _, _, o in seen]
-        passes = sum(1 for o in outcomes if o == "passed")
-        fails = sum(1 for o in outcomes if o in ("failed", "error"))
-        skips = sum(1 for o in outcomes if o == "skipped")
+        outcomes = [o for _, _, o, _ in seen]
+        reruns = outcomes.count("passed_on_rerun")
+        passes = outcomes.count("passed") + reruns
+        fails = sum(1 for o in outcomes if o in ("failed", "error")) + reruns
+        skips = outcomes.count("skipped")
         streak = 0
         for o in outcomes:
             if o == "passed":
                 streak += 1
             elif o != "skipped":
                 break
-        executed = passes + fails
-        status = ("flaky" if passes and fails else "failing" if fails
+        executed = sum(1 for o in outcomes if o in (
+            "passed", "failed", "error", "passed_on_rerun"))
+        flips = 0
+        if use_commits:
+            for c in {commit_of[r] for _, r, _, _ in seen} - {None, ""}:
+                at_c = [o for _, r, o, _ in seen if commit_of[r] == c]
+                ok = any(o in ("passed", "passed_on_rerun") for o in at_c)
+                bad = any(o in ("failed", "error", "passed_on_rerun")
+                          for o in at_c)
+                flips += ok and bad
+        counts = {}
+        for _, _, o, msg in seen:
+            if o in ("failed", "error", "passed_on_rerun"):
+                sig = _reference_signature(msg)
+                counts[sig] = counts.get(sig, 0) + 1
+        modes = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+        recovered = streak >= stable_runs
+        status = ("recovered" if passes and fails and recovered
+                  else "flaky" if passes and fails else "failing" if fails
                   else "passing" if passes else "unknown")
         s = {"runs": executed, "recorded": len(outcomes), "passes": passes,
              "failures": fails, "skips": skips,
              "flake_rate": (fails / executed) if executed else 0.0,
-             "pass_streak": streak, "status": status, "test_id": tid,
+             "pass_streak": streak, "status": status,
+             "same_run_flips": reruns, "same_commit_flips": flips,
+             "proven": bool(reruns or flips),
+             "failure_modes": [{"message": m, "count": c} for m, c in modes],
+             "test_id": tid,
              "quarantined": store_mod.is_quarantined(conn, tid)}
         if recent and last_run not in recent:
             s["retired"] = True
             s["last_run"] = last_run
-            s["last_commit"] = conn.execute(
-                "SELECT commit_sha FROM runs WHERE id = ?", (last_run,)).fetchone()[0]
+            s["last_commit"] = commit_of[last_run]
             retired.append(s)
             continue
         s["retired"] = False
+        if status == "flaky" and s["proven"]:
+            flaky.append(s)
+            continue
         if executed < min_runs:
             continue
-        recovered = streak >= stable_runs
-        if status == "flaky" and not recovered:
+        if status == "flaky":
             flaky.append(s)
         elif status == "failing":
             broken.append(s)
         if s["quarantined"] and recovered:
             stable.append(s)
-    flaky.sort(key=lambda s: (-s["flake_rate"], -s["failures"]))
+    flaky.sort(key=lambda s: (not s["proven"], -s["flake_rate"],
+                              -s["failures"]))
     broken.sort(key=lambda s: -s["failures"])
     retired.sort(key=lambda s: (rank[s["last_run"]], s["test_id"]))
     return {"flaky": flaky, "broken": broken, "stable": stable,
@@ -1587,7 +1647,7 @@ def reference_analyze(conn, min_runs=5, stable_runs=10, window=50,
 EQUIVALENCE_QUARANTINED = (3, 37, 66, 99, 121, 130, 140)
 
 
-def equivalence_history() -> list:
+def equivalence_history(shared_commits: bool = False) -> list:
     """~3.6k rows of seeded-random history incl. quarantined, flaky,
     broken, skip-heavy, and late-joiner (< min_runs) tests, as
     [(commit, results)] for its runs, oldest first."""
@@ -1613,19 +1673,33 @@ def equivalence_history() -> list:
                 outcome = rng.choice(["failed", "error"])
             elif kind == "flaky":
                 outcome = rng.choices(
-                    ["passed", "failed", "error", "skipped"],
-                    weights=[55, 25, 5, 15])[0]
+                    ["passed", "failed", "error", "skipped",
+                     "passed_on_rerun"],
+                    weights=[55, 25, 5, 15, 2])[0]
             else:
                 outcome = rng.choice(["passed", "skipped"])
-            results.append(result(tid, outcome))
-        runs.append((f"sha{run}", results))
+            r = result(tid, outcome)
+            if outcome != "passed":
+                r["message"] = rng.choice([
+                    "timeout after %d.%ds" % (rng.randint(1, 60),
+                                              rng.randint(0, 9)),
+                    "ConnectionError: port %d" % rng.randint(1000, 9999),
+                    "assert 0x%x == 0" % rng.randint(1, 1 << 32),
+                    "", "AssertionError\ntraceback line %d" % run])
+            results.append(r)
+        commit = f"sha{run}"
+        if shared_commits:
+            # runs 6 and 7, and 16 and 17, re-ran one commit; one has none
+            commit = (None if run == 20 else
+                      f"sha{run - 1}" if run in (7, 17) else commit)
+        runs.append((commit, results))
     return runs
 
 
 def make_equivalence_db(tmp: str) -> str:
     db = os.path.join(tmp, "eq.db")
     conn = store_mod.connect(db)
-    for commit, results in equivalence_history():
+    for commit, results in equivalence_history(shared_commits=True):
         store_mod.record_run(conn, results, commit_sha=commit)
     # quarantine a spread across kinds
     for i in EQUIVALENCE_QUARANTINED:
@@ -1964,7 +2038,7 @@ class TestRetired(unittest.TestCase):
         self.assertEqual(json.loads(out), {"quarantined": ["t::gone"], "new": []})
         code, out, _ = run_cli("--db", db, "report")
         self.assertIn("still quarantined", out)
-        self.assertIn('flakebox unquarantine --test "t::gone"', out)
+        self.assertIn("`flakebox unquarantine --test t::gone`", out)
 
 
 def record_runs(tmp: str, db: str, n: int = 6, flaky_until: int = 3) -> None:
@@ -2370,6 +2444,8 @@ class TestEmptyReport(unittest.TestCase):
                           "--commit", commit, *extra)
 
     def runs_in(self, db: str) -> int:
+        if not os.path.exists(db):
+            return 0    # nothing was ever recorded there
         exp = db + ".json"
         self.assertEqual(run_cli("--db", db, "export", "--out", exp)[0], 0)
         with open(exp, encoding="utf-8") as f:
@@ -2490,6 +2566,7 @@ class TestDbFlagPosition(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("recorded run 1", out)
         # neither given: the HOME-relative default
+        empty_db(cli_mod.default_db())
         code, out, _ = run_cli("report")
         self.assertEqual(code, 0)
         self.assertIn(cli_mod.default_db(), out)
@@ -3641,7 +3718,7 @@ class TestExportTarget(unittest.TestCase):
 
     def refused(self, out_path) -> str:
         tmp = mktemp()
-        code, out, err = run_cli("--db", os.path.join(tmp, "x.db"),
+        code, out, err = run_cli("--db", empty_db(os.path.join(tmp, "x.db")),
                                  "export", "--out", out_path)
         self.assertEqual(code, 2, out + err)
         self.assertEqual(out, "")
@@ -3660,7 +3737,7 @@ class TestExportTarget(unittest.TestCase):
     def test_a_file_that_can_be_written_still_is(self):
         tmp = mktemp()
         target = os.path.join(tmp, "out.json")
-        code, out, err = run_cli("--db", os.path.join(tmp, "x.db"),
+        code, out, err = run_cli("--db", empty_db(os.path.join(tmp, "x.db")),
                                  "export", "--out", target)
         self.assertEqual(code, 0, err)
         self.assertIn("exported 0 run(s)", out)

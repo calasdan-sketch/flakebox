@@ -143,12 +143,13 @@ def test_history(conn: sqlite3.Connection, test_id: str,
     """One test's results, newest run first (see NEWEST_FIRST)."""
     cur = conn.cursor()
     cur.execute(
-        "SELECT r.outcome, r.duration_ms, runs.commit_sha, runs.created_at"
-        " FROM results r JOIN runs ON r.run_id = runs.id"
+        "SELECT r.outcome, r.duration_ms, runs.commit_sha, runs.created_at,"
+        " r.message FROM results r JOIN runs ON r.run_id = runs.id"
         f" WHERE r.test_id = ? ORDER BY {NEWEST_FIRST} LIMIT ?",
         (test_id, limit))
-    return [{"outcome": o, "duration_ms": d, "commit": c, "at": t}
-            for o, d, c, t in cur.fetchall()]
+    return [{"outcome": o, "duration_ms": d, "commit": c, "at": t,
+             "message": m}
+            for o, d, c, t, m in cur.fetchall()]
 
 
 def recent_run_ids(conn: sqlite3.Connection, n: int) -> list[int]:
@@ -185,9 +186,15 @@ def quarantine_add(conn: sqlite3.Connection, test_id: str,
     return cur.rowcount == 1
 
 
-def quarantine_remove(conn: sqlite3.Connection, test_id: str) -> None:
-    conn.execute("DELETE FROM quarantine WHERE test_id = ?", (test_id,))
+def quarantine_remove(conn: sqlite3.Connection, test_id: str) -> bool:
+    """Release a test. Returns True if it was in quarantine."""
+    cur = conn.execute("DELETE FROM quarantine WHERE test_id = ?", (test_id,))
     conn.commit()
+    return cur.rowcount == 1
+
+
+def run_count(conn: sqlite3.Connection) -> int:
+    return conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
 
 
 def quarantined(conn: sqlite3.Connection) -> list[dict]:
