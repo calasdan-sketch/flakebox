@@ -15,6 +15,16 @@ inputs:
     description: "Executed runs (skips excluded) before a test can be called flaky; passed to `flakebox report --min-runs`"
     required: false
     default: "5"
+  env:
+    description: >-
+      The environment name recorded with each run (`flakebox record
+      --env`). Same-commit proof of flakiness only compares runs of one
+      environment, so a test that passes on Linux and fails on Windows at
+      one commit is not called flaky for that. Empty (default) uses
+      "<db-key>-<runner.os>"; set it per matrix combination, e.g.
+      "${{ matrix.os }}-py${{ matrix.python }}".
+    required: false
+    default: ""
   fail-on-flaky:
     description: >-
       Fail the step when flaky tests are detected that are not yet
@@ -120,11 +130,15 @@ runs:
         FB_JUNIT: ${{ inputs.junit }}
         FB_COMMIT: ${{ github.sha }}
         FB_BRANCH: ${{ github.ref_name }}
+        FB_ENV: ${{ inputs.env }}
+        FB_DB_KEY: ${{ inputs.db-key }}
+        FB_RUNNER_OS: ${{ runner.os }}
       run: >
         python3 -m flakebox record
         --junit="$FB_JUNIT"
         --commit="$FB_COMMIT"
         --branch="$FB_BRANCH"
+        --env="${FB_ENV:-$FB_DB_KEY-$FB_RUNNER_OS}"
 
     - name: Report
       id: report

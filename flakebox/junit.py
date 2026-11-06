@@ -7,10 +7,16 @@ import sys
 import xml.etree.ElementTree as ET
 from xml.parsers import expat
 
+from . import safe
 from .quarantine import REASON as QUARANTINE_REASON
 
 # outcome per testcase
 PASSED, FAILED, ERROR, SKIPPED = "passed", "failed", "error", "skipped"
+# Failed, then passed when the runner retried it, inside ONE run: Maven
+# Surefire/Failsafe with rerunFailingTestsCount write the passing testcase
+# with <flakyFailure>/<flakyError> children. Proof of flakiness on its own.
+PASSED_ON_RERUN = "passed_on_rerun"
+FLAKY_ELEMENTS = ("flakyFailure", "flakyError")
 
 MAX_MS = 2 ** 63 - 1  # the largest duration an SQLite INTEGER can hold
 
@@ -36,9 +42,28 @@ def _is_quarantine_xfail(skipped_el) -> bool:
     return QUARANTINE_REASON in text
 
 
+def _message(el) -> str:
+    """The failure message of a <failure>/<error>/<flakyFailure> element:
+    its `message` attribute; else the first non-blank line of its own text
+    (runners that put everything in the body); else its `type` (Surefire
+    leaves `message` out for an exception with a null message and puts the
+    trace in a <stackTrace> child, so the element's own text is blank). At
+    most 500 characters."""
+    msg = (el.get("message", "") or "").strip()
+    if not msg:
+        for line in (el.text or "").splitlines():
+            if line.strip():
+                msg = line.strip()
+                break
+    if not msg:
+        msg = (el.get("type", "") or "").strip()
+    return msg[:500]
+
+
 def _warn(msg: str) -> None:
     try:
-        print(f"flakebox: warning: {msg}", file=sys.stderr)
+        # msg can carry a test id or a path from the report: escaped
+        print(f"flakebox: warning: {safe.text(msg)}", file=sys.stderr)
     except (OSError, ValueError):
         pass
 
@@ -116,11 +141,13 @@ def parse_bytes(raw: bytes, path: str = "", warn=_warn) -> list[dict]:
             else:
                 outcome, message = SKIPPED, ""
         elif tc.find("failure") is not None:
-            el = tc.find("failure")
-            outcome, message = FAILED, (el.get("message", "") or "")[:500]
+            outcome, message = FAILED, _message(tc.find("failure"))
         elif tc.find("error") is not None:
-            el = tc.find("error")
-            outcome, message = ERROR, (el.get("message", "") or "")[:500]
+            outcome, message = ERROR, _message(tc.find("error"))
+        elif any(tc.find(tag) is not None for tag in FLAKY_ELEMENTS):
+            el = next(tc.find(tag) for tag in FLAKY_ELEMENTS
+                      if tc.find(tag) is not None)
+            outcome, message = PASSED_ON_RERUN, _message(el)
         else:
             outcome, message = PASSED, ""
         results.append({"test_id": tid, "outcome": outcome,

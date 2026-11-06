@@ -1,11 +1,70 @@
 # Flakebox (`flakebox`)
 
-Self-hosted flaky-test triage for small teams. Flaky tests waste CI time and erode
-trust in every red build. Hosted services (for example Trunk Flaky Tests)
-solve this as a service; flakebox is the free, self-hosted alternative:
-ingest JUnit XML, detect flakiness statistically, quarantine the flakes,
-and get told when they're stable enough to come back. SQLite, stdlib-only,
-no SaaS.
+**Find, prove and quarantine flaky tests from the JUnit XML you already
+have — one SQLite file, zero dependencies, no account.**
+
+Flaky tests waste CI time and erode trust in every red build. Hosted
+services (Trunk Flaky Tests, Datadog Test Optimization, Buildkite Test
+Engine) solve this as a service; flakebox is the free, self-hosted
+alternative: ingest JUnit XML, detect flakiness statistically, **prove** it
+when the same commit both passed and failed, quarantine the flakes, and get
+told when they're stable enough to come back.
+
+## Quick start (60 seconds, synthetic example)
+
+> The proof, failure-mode and safe-output features below are 0.5.0, which
+> is unreleased: install from this repository
+> (`pip install git+https://github.com/calasdan-sketch/flakebox`) until it
+> is on PyPI. See `CHANGELOG.md`.
+
+```bash
+pip install flakebox
+# record two CI runs of the same commit (here: a re-run that went green)
+flakebox record --junit run1.xml --commit=abc123
+flakebox record --junit run2.xml --commit=abc123
+flakebox report
+```
+
+Output on that synthetic pair of reports (one test failed in run 1 only,
+one Maven Surefire test needed its built-in retry in both runs):
+
+```
+## Flaky (pass AND fail - quarantine candidates)
+| test | flake rate | fails/passes | runs | proof | top failure |
+|---|---|---|---|---|---|
+| `tests.test_api::test_login` | 50% | 1/1 | 2 | same commit | ConnectionError: port N refused after Ns |
+| `com.acme.CartTest::checkout` | 0% | 0/2 | 2 | passed on retry x2 | expected: 200 but was: 503 |
+```
+
+(`checkout` never ended red - its rate is 0% - but the runner had to
+retry it in both runs.) Two runs were enough: the same code gave both
+answers, so no amount of
+extra history could make these tests less flaky (see
+[Proof of flakiness](#proof-of-flakiness)). Without proof, a test needs
+`--min-runs` (5) executed runs before it is called flaky.
+
+## How it compares
+
+Only what each project documents; follow the links. "—" means the linked
+page does not describe it, not that it is impossible.
+
+| | flakebox | [Trunk Flaky Tests](https://docs.trunk.io/flaky-tests/overview) | [Datadog Flaky Test Mgmt](https://docs.datadoghq.com/tests/flaky_management/) | [Buildkite Test Engine](https://trunk.io/compare/trunk-vs-buildkite) | [flakewall](https://github.com/cicatriiz/flakewall) | [pytest-rerunfailures](https://pypi.org/project/pytest-rerunfailures/) |
+|---|---|---|---|---|---|---|
+| Self-hosted, no account | yes (SQLite file) | no (SaaS) | no (SaaS) | no (SaaS) | yes (YAML file) | yes (plugin) |
+| Input | JUnit XML, any runner | "language-, environment-, and framework-agnostic" | — | collectors; JUnit XML | JUnit XML | pytest only |
+| Long-run statistical detection | yes (window of 50 runs) | yes (threshold monitor) | yes (failure-rate policies) | yes (flakiness score) | pass/fail flips across given reports | no (retries only) |
+| Same-commit / retry proof | yes, both | pass-on-retry | — | pass-on-retry | — | — |
+| Separates broken from flaky | yes | yes | yes | — | — | n/a |
+| Quarantine that keeps running tests | yes (`--mode xfail`) | yes | yes | Buildkite Pipelines only | yes (guard list) | n/a |
+| Leaves quarantine when fixed | tells you (stable streak) | configurable recovery period | yes ("Fixed" state) | — | TTL expiry | n/a |
+| Failure grouping | normalized messages | AI clustering by stack trace | AI root-cause categories | — | — | — |
+| Ticketing, PR comments, dashboards | no | yes | yes | yes | Slack, annotations | no |
+
+The hosted tools do much more around the workflow (PR comments, tickets,
+ownership, dashboards); flakebox is for teams that want the detection and
+the quarantine without sending test data anywhere.
+
+## Install
 
 ## Install
 
@@ -63,6 +122,19 @@ cannot be created, an integer option that reaches the database
 stores (-9223372036854775808 to 9223372036854775807), and a `--commit`,
 `--branch` or `--test` that is not valid UTF-8 text (a stray byte in the
 command line).
+
+`report`, `quarantine`, `history`, `export` and `unquarantine` need a
+database that exists: a mistyped `--db` is `error: no flakebox database
+at ...`, exit 2, and no file is created (before 0.5.0 it created an empty
+one and reported "No flaky tests detected"). `record` and `import` create
+it. A database with no runs in it says `No runs recorded yet`.
+`unquarantine` of a test that is not quarantined says so on stderr.
+`unquarantine --all-stable` / `--all-retired` release every quarantined
+test the report would list as stable / retired (they take the same
+threshold options as `report`). A read command also refuses a `--db` that
+exists but is not flakebox's: a zero-byte file or another program's
+SQLite database is `error: ... is not a flakebox database`, exit 2, and is
+left untouched (it is opened read-only to check).
 
 `flakebox record` hashes the report: recording the same file for the
 same commit twice says `already recorded as run N` and adds nothing
@@ -165,6 +237,9 @@ Example report:
 - `tests.test_d::test_removed` (was failing; last seen run 41, commit 9f3c2a1)
 ```
 
+(The flaky table also has the `proof` and `top failure` columns shown in
+the quick start; trimmed here.)
+
 ## How detection works
 
 No ML, fully explainable. Only *executed* runs count — a skipped run is
@@ -199,8 +274,92 @@ into a DB never makes old runs look recent.
 - Everything else (always passing, or too few executed runs) is not
   reported.
 
-The flake rate is failures ÷ executed runs; the `runs` column is
-executed runs. History lives in SQLite (`--db` to override).
+The flake rate is the share of executed runs that ended red (`failed` or
+`error`); a run that passed only on a retry ended green and is not
+counted in it, it is counted in the `proof` column instead. The `runs`
+column is executed runs. History lives in SQLite (`--db` to override).
+
+### Proof of flakiness
+
+Google defines a flaky result as "a test that exhibits both a passing and
+a failing result with the same code"
+([Google Testing Blog, 2016](https://testing.googleblog.com/search/label/John%20Micco)).
+flakebox records which commit every run came from, so it can check exactly
+that, and it reads the retry evidence some runners write:
+
+- **same commit**: the test passed in one run and failed in a
+  *different* run of the same `--commit` **and the same `--env`**. A CI
+  "re-run" of a red build gives this for free. Two results inside one run
+  (a duplicate test id, e.g. jest-junit names without the file path) never
+  count, and neither do runs from different environments: a test that
+  passes on Linux and fails on Windows at one commit has a platform bug,
+  not a flake. Set `flakebox record --env NAME` on every matrix leg (the
+  Action does it for you: its `env` input defaults to
+  `<db-key>-<runner.os>`; set it per combination, such as
+  `${{ matrix.os }}-py${{ matrix.python }}`, when one OS runs several
+  Python versions). Runs recorded without `--env` share one environment.
+- **passed on retry**: Maven Surefire / Failsafe with
+  `rerunFailingTestsCount` write a test that failed and then passed as a
+  `<testcase>` with `<flakyFailure>` / `<flakyError>` children
+  ([Surefire docs](https://maven.apache.org/surefire/maven-surefire-plugin/examples/rerun-failing-tests.html)).
+  flakebox records it as `passed_on_rerun`: one executed run that ended
+  green, so it counts as a pass and not in the flake rate, but it makes the
+  test flaky, is one `passed on retry` proof (never also a same-commit
+  one), and breaks a pass streak. A test that failed
+  every retry (`<failure>` plus `<rerunFailure>`) is a plain failure.
+
+A flaky test with proof is reported (and `quarantine`d) with fewer than
+`--min-runs` executed runs, and ranks first; the `proof` column and
+`flakebox history` say which proof. A *recovered* test (newest
+`--stable-runs` runs all passed) stays recovered either way. JSON output
+carries `same_commit_flips`, `same_run_flips` and `proven` per test.
+
+`--ignore-commits` (on `report`, `quarantine` and `history`) turns the
+same-commit proof off. Use it when the DB holds local runs from an
+uncommitted worktree, or runs that all used one placeholder `--commit`:
+then "the same commit" was not the same code. Runs recorded without
+`--commit` never count as the same commit.
+
+### Failure modes
+
+Each failing run's message (the `message` attribute; else the first line
+of the element's text; else its `type`, which is what Surefire leaves for
+an exception without a message) is folded into a signature: only values
+that change from run to run become `N` - numbers with decimals or a time
+or `%` unit (`30.2s`, `3000 ms`), numbers after a `:` (ports, line
+numbers), numbers of four or more digits, `0x` addresses and UUIDs -
+whitespace is collapsed, first line only. So `timeout after 30.2s` and
+`timeout after 31.7s` are one mode, while `assert 404 == 200` and `assert
+500 == 200`, `HTTP 503` and `HTTP 401`, `user_1` and `user_2` stay
+apart. The report shows each flaky or failing test's most common mode,
+`history` lists the top three with counts (and each failed run's
+message), and the JSON has `failure_modes: [{"message", "count",
+"example"}]`, where `example` is the newest raw message of that mode. It is string folding,
+not clustering: two different stack traces with the same first line are
+one mode.
+
+### Untrusted text is printed safely
+
+Test ids, failure messages, commits and branches come from whoever wrote
+the test or pushed the branch. Every text output escapes control
+characters, bidi overrides and zero-width characters (`\x1b`, `\u202e`,
+`\u200b`), so a test id cannot clear your terminal or disguise itself as
+another id. In the markdown report a `|` in an id is escaped (it would
+otherwise split the table cell on GitHub) and backticks get a longer code
+fence. The suggested `flakebox unquarantine --test ...` commands are
+quoted so that pasting one runs flakebox and nothing else. On POSIX
+shells that is single-quoting (`shlex.quote`), which is safe for every
+id. On Windows no quoting is safe in both `cmd.exe` and PowerShell for
+every character, so an id is only put in the command, in double quotes,
+when it consists of letters, digits, spaces and `_ . : / [ ] - , = + @ #
+~`. For any other id (one with `&`, `%`, `!`, `$`, a backtick, `"`, `\`),
+and on every platform for an id with `|`, a backtick or a control
+character, the report suggests a command that needs no id instead:
+`flakebox unquarantine --all-stable --stable-runs N` or `--all-retired
+--retire-after N`, which release every test the report lists in that
+section. JSON output escapes all of this already. The
+`--format deselect` line is the exception by design: it must be the exact
+ids, quoted for the shell.
 
 ### Quarantine modes
 
@@ -328,6 +487,20 @@ requires it.
 - **Any DOCTYPE is refused**, harmless or not: JUnit reports never need
   one, and refusing them all keeps the XML-bomb check simple.
 - **The Action's cache steps use the `v4` tag**, not a commit SHA (above).
+- **Same-commit proof trusts `--commit` and `--env`.** A placeholder
+  commit reused for different code, matrix legs recorded without distinct
+  `--env` values and then merged, or a test that broke because something
+  outside the repo changed between two runs of one commit, are reported as
+  proven flaky. `--ignore-commits` turns the proof off. Runs recorded
+  before 0.5.0 have no environment and share one.
+- **Retry proof is read from Surefire/Failsafe's `flakyFailure` /
+  `flakyError` only.** Other runners' retry output (pytest-rerunfailures,
+  jest `retryTimes`, ...) is not recognised as a retry; whatever they write
+  as the final result is recorded.
+- **Failure modes fold text, they do not cluster** (see above).
+- **A first-ever build with an empty report fails the Action's report
+  step**: nothing was recorded, so there is no database to report on
+  (`error: no flakebox database`). The next build that runs tests creates it.
 
 ## Tests
 

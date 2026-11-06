@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS runs (
     commit_sha TEXT,
     branch TEXT,
     created_at INTEGER,
-    report_sha TEXT
+    report_sha TEXT,
+    env TEXT
 );
 CREATE TABLE IF NOT EXISTS results (
     run_id INTEGER,
@@ -35,6 +36,38 @@ CREATE TABLE IF NOT EXISTS quarantine (
 """
 
 EXPORT_FORMAT = 1
+
+# The outcomes flakebox writes (junit.py). An import with any other outcome
+# is refused: nothing could count it, and it would be printed by `history`.
+OUTCOMES = ("passed", "failed", "error", "skipped", "passed_on_rerun")
+TABLES = ("runs", "results", "quarantine")
+
+
+class NotFlakeboxDB(Exception):
+    """An existing file that is not a flakebox database."""
+
+
+def check_existing(db_path: str) -> None:
+    """Fail closed before a read command touches `db_path`: it must be a
+    non-empty SQLite file that already has flakebox's tables. Opened
+    read-only, so a foreign database is never given flakebox's schema.
+    Raises NotFlakeboxDB (or sqlite3.DatabaseError for a non-SQLite file)."""
+    if os.path.isfile(db_path) and os.path.getsize(db_path) == 0:
+        raise NotFlakeboxDB("the file is empty")
+    if not os.path.isfile(db_path):
+        return  # a directory and the like: connect() reports it
+    from pathlib import Path
+    uri = Path(db_path).absolute().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        names = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+    finally:
+        conn.close()
+    missing = [t for t in TABLES if t not in names]
+    if missing:
+        raise NotFlakeboxDB("no flakebox tables in it (missing: "
+                            + ", ".join(missing) + ")")
 
 
 def connect(db_path: str) -> sqlite3.Connection:
@@ -61,6 +94,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
     if "report_sha" not in cols:
         conn.execute("ALTER TABLE runs ADD COLUMN report_sha TEXT")
+        conn.commit()
+    if "env" not in cols:   # flakebox < 0.5: every run had one environment
+        conn.execute("ALTER TABLE runs ADD COLUMN env TEXT")
         conn.commit()
     fingerprint_legacy_runs(conn)
 
@@ -97,14 +133,15 @@ def fingerprint_legacy_runs(conn: sqlite3.Connection) -> int:
 
 
 def find_run(conn: sqlite3.Connection, commit_sha: str | None,
-             report_sha: str | None) -> int | None:
+             report_sha: str | None, env: str | None = None) -> int | None:
     """The id of a run already recorded from the same report (same
-    commit, same report bytes), or None."""
+    commit, same environment, same report bytes), or None."""
     if report_sha is None:
         return None
     row = conn.execute(
         "SELECT id FROM runs WHERE commit_sha IS ? AND report_sha = ? "
-        "ORDER BY id LIMIT 1", (commit_sha, report_sha)).fetchone()
+        "AND env IS ? ORDER BY id LIMIT 1",
+        (commit_sha, report_sha, env)).fetchone()
     return row[0] if row else None
 
 
@@ -112,15 +149,17 @@ def record_run(conn: sqlite3.Connection, results: list[dict],
                commit_sha: str | None = None,
                branch: str | None = None,
                report_sha: str | None = None,
-               created_at: int | None = None) -> int:
+               created_at: int | None = None,
+               env: str | None = None) -> int:
     at = int(time.time()) if created_at is None else int(created_at)
     rows = [(r["test_id"], r["outcome"], r["duration_ms"], r["message"])
             for r in results]
     if report_sha is None:  # no report bytes to hash: fingerprint the content
         report_sha = legacy_fingerprint(commit_sha, at, rows)
     cur = conn.cursor()
-    cur.execute("INSERT INTO runs (commit_sha, branch, created_at, report_sha) "
-                "VALUES (?, ?, ?, ?)", (commit_sha, branch, at, report_sha))
+    cur.execute("INSERT INTO runs (commit_sha, branch, created_at, report_sha,"
+                " env) VALUES (?, ?, ?, ?, ?)",
+                (commit_sha, branch, at, report_sha, env))
     run_id = cur.lastrowid
     cur.executemany(
         "INSERT INTO results (run_id, test_id, outcome, duration_ms, message)"
@@ -143,12 +182,14 @@ def test_history(conn: sqlite3.Connection, test_id: str,
     """One test's results, newest run first (see NEWEST_FIRST)."""
     cur = conn.cursor()
     cur.execute(
-        "SELECT r.outcome, r.duration_ms, runs.commit_sha, runs.created_at"
-        " FROM results r JOIN runs ON r.run_id = runs.id"
+        "SELECT r.outcome, r.duration_ms, runs.commit_sha, runs.created_at,"
+        " r.message, runs.env, runs.id FROM results r"
+        " JOIN runs ON r.run_id = runs.id"
         f" WHERE r.test_id = ? ORDER BY {NEWEST_FIRST} LIMIT ?",
         (test_id, limit))
-    return [{"outcome": o, "duration_ms": d, "commit": c, "at": t}
-            for o, d, c, t in cur.fetchall()]
+    return [{"outcome": o, "duration_ms": d, "commit": c, "at": t,
+             "message": m, "env": e, "run_id": rid}
+            for o, d, c, t, m, e, rid in cur.fetchall()]
 
 
 def recent_run_ids(conn: sqlite3.Connection, n: int) -> list[int]:
@@ -185,9 +226,15 @@ def quarantine_add(conn: sqlite3.Connection, test_id: str,
     return cur.rowcount == 1
 
 
-def quarantine_remove(conn: sqlite3.Connection, test_id: str) -> None:
-    conn.execute("DELETE FROM quarantine WHERE test_id = ?", (test_id,))
+def quarantine_remove(conn: sqlite3.Connection, test_id: str) -> bool:
+    """Release a test. Returns True if it was in quarantine."""
+    cur = conn.execute("DELETE FROM quarantine WHERE test_id = ?", (test_id,))
     conn.commit()
+    return cur.rowcount == 1
+
+
+def run_count(conn: sqlite3.Connection) -> int:
+    return conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
 
 
 def quarantined(conn: sqlite3.Connection) -> list[dict]:
@@ -212,14 +259,14 @@ def export_data(conn: sqlite3.Connection) -> dict:
     the quarantine set). Written by `flakebox export`; read back by
     `flakebox import`, which merges instead of overwriting."""
     runs = []
-    cur = conn.execute("SELECT id, commit_sha, branch, created_at, report_sha "
-                       "FROM runs ORDER BY id")
-    for run_id, commit, branch, at, sha in cur.fetchall():
+    cur = conn.execute("SELECT id, commit_sha, branch, created_at, report_sha,"
+                       " env FROM runs ORDER BY id")
+    for run_id, commit, branch, at, sha, env in cur.fetchall():
         rows = conn.execute(
             "SELECT test_id, outcome, duration_ms, message FROM results "
             "WHERE run_id = ? ORDER BY rowid", (run_id,)).fetchall()
         runs.append({"commit": commit, "branch": branch, "created_at": at,
-                     "report_sha": sha,
+                     "report_sha": sha, "env": env,
                      "results": [list(r) for r in rows]})
     return {"flakebox_export": EXPORT_FORMAT, "runs": runs,
             "quarantine": quarantined(conn)}
@@ -285,6 +332,7 @@ def validate_export(data) -> dict:
             raise ValueError(f"export: runs[{i}] must be an object")
         _text(run.get("commit"), f"runs[{i}].commit")
         _text(run.get("branch"), f"runs[{i}].branch")
+        _text(run.get("env"), f"runs[{i}].env")
         _text(run.get("report_sha"), f"runs[{i}].report_sha")
         _number(run.get("created_at"), f"runs[{i}].created_at")
         results = run.get("results")
@@ -300,6 +348,9 @@ def validate_export(data) -> dict:
                                  f"[test_id, outcome, duration_ms, message]")
             _text(row[0], f"{where}[0] (test_id)", optional=False)
             _text(row[1], f"{where}[1] (outcome)", optional=False)
+            if row[1] not in OUTCOMES:
+                raise ValueError(f"export: {where}[1] (outcome) is not one of "
+                                 f"{', '.join(OUTCOMES)}")
             _number(row[2], f"{where}[2] (duration_ms)")
             _text(row[3], f"{where}[3] (message)")
     quarantine = data.get("quarantine")
@@ -334,13 +385,14 @@ def import_data(conn: sqlite3.Connection, data: dict) -> dict:
         at = run.get("created_at")
         sha = run.get("report_sha") or legacy_fingerprint(run.get("commit"),
                                                           at, rows)
-        if find_run(conn, run.get("commit"), sha) is not None:
+        if find_run(conn, run.get("commit"), sha, run.get("env")) is not None:
             skipped += 1
             continue
         results = [{"test_id": t, "outcome": o, "duration_ms": d, "message": m}
                    for t, o, d, m in rows]
         record_run(conn, results, run.get("commit"), run.get("branch"),
-                   report_sha=sha, created_at=0 if at is None else at)
+                   report_sha=sha, created_at=0 if at is None else at,
+                   env=run.get("env"))
         added += 1
     q_added = 0
     for q in data["quarantine"]:
