@@ -44,14 +44,19 @@ def _is_quarantine_xfail(skipped_el) -> bool:
 
 def _message(el) -> str:
     """The failure message of a <failure>/<error>/<flakyFailure> element:
-    its `message` attribute, or else the first non-blank line of its text
-    (runners that put everything in the body), at most 500 characters."""
+    its `message` attribute; else the first non-blank line of its own text
+    (runners that put everything in the body); else its `type` (Surefire
+    leaves `message` out for an exception with a null message and puts the
+    trace in a <stackTrace> child, so the element's own text is blank). At
+    most 500 characters."""
     msg = (el.get("message", "") or "").strip()
     if not msg:
         for line in (el.text or "").splitlines():
             if line.strip():
                 msg = line.strip()
                 break
+    if not msg:
+        msg = (el.get("type", "") or "").strip()
     return msg[:500]
 
 

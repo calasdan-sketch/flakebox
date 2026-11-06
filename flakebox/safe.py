@@ -7,7 +7,8 @@ clear the screen, retitle the window or hide the lines before it), and a
 bidi override or zero-width character can make one id look like another.
 Everything flakebox prints in its text formats goes through `text()`;
 markdown cells also go through `md_code()`, and suggested commands through
-`shell_arg()` so pasting one can never run anything. JSON output is already
+`shell_arg()`, which refuses (returns None) any value it cannot quote so
+that pasting the command is certainly harmless. JSON output is already
 safe: `json.dumps` escapes every control and non-ASCII character.
 """
 
@@ -16,7 +17,6 @@ from __future__ import annotations
 import os
 import re
 import shlex
-import subprocess
 
 # C0 and C1 controls and DEL; bidi embeddings, overrides, isolates and
 # marks; zero-width characters; the line/paragraph separators and the BOM.
@@ -70,13 +70,34 @@ def md_cell(value) -> str:
     return s
 
 
-def shell_arg(value: str) -> str:
-    """`value` quoted as one argument for the local shell (POSIX quoting;
-    cmd.exe quoting on Windows), so a suggested command printed with it
-    can be pasted as is: an id containing `$(...)` or `"` stays a string.
-    Control characters are escaped first, so the line cannot be altered on
-    screen either."""
-    s = text(value)
-    if os.name == "nt":
-        return subprocess.list2cmdline([s])
-    return shlex.quote(s)
+# Characters that are literal inside double quotes in BOTH cmd.exe and
+# PowerShell. Not in the list, and so never put in a Windows command:
+# `"` (ends the quotes), `%` and `!` (cmd variable expansion), `$` and the
+# backtick (PowerShell expansion and escapes), `\` (escapes a closing quote
+# for the C runtime), and every control character.
+_WINDOWS = os.name == "nt"   # tests patch this to try the Windows branch
+_WINDOWS_SAFE = re.compile(r"[A-Za-z0-9_.:/\[\]\- ,=+@#~]+")
+
+
+def shell_arg(value: str, windows: bool | None = None) -> str | None:
+    """`value` quoted as one argument for the local shell, or None when it
+    cannot be written so that pasting it is certainly harmless. Callers
+    print another way to do the same thing for None.
+
+    - POSIX: shlex.quote - single quotes, which the shell never expands
+      inside, so any value is safe.
+    - Windows (`windows=True`, default: os.name == "nt"): there is no
+      quoting that is safe in both cmd.exe and PowerShell for every
+      character, so only values made of _WINDOWS_SAFE characters are
+      quoted (in double quotes); anything else is None.
+    - A value with a control, bidi or zero-width character is None on
+      both: printed escaped, it would no longer be the same value."""
+    if text(value) != value:
+        return None
+    if windows is None:
+        windows = _WINDOWS
+    if windows:
+        if not _WINDOWS_SAFE.fullmatch(value):
+            return None
+        return f'"{value}"'
+    return shlex.quote(value)

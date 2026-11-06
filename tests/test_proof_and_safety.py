@@ -9,6 +9,7 @@ import os
 import shlex
 import time
 import unittest
+from unittest import mock
 
 from flakebox import cli as cli_mod
 from flakebox import detect as detect_mod
@@ -28,12 +29,15 @@ def res(tid, outcome, message=""):
 
 
 def db_with(runs, name="p.db"):
-    """runs: [(commit, [result, ...])] oldest first, one second apart."""
+    """runs: [(commit, [result, ...])] or [(commit, env, [result, ...])]
+    oldest first, one second apart."""
     db = os.path.join(mktemp(), name)
     conn = store_mod.connect(db)
     t0 = 1_700_000_000
-    for i, (commit, rs) in enumerate(runs):
-        store_mod.record_run(conn, rs, commit_sha=commit, created_at=t0 + i)
+    for i, run in enumerate(runs):
+        commit, env, rs = run if len(run) == 3 else (run[0], None, run[1])
+        store_mod.record_run(conn, rs, commit_sha=commit, created_at=t0 + i,
+                             env=env)
     conn.close()
     return db
 
@@ -89,9 +93,12 @@ class TestSurefireReruns(unittest.TestCase):
         self.assertEqual(sorted(flaky), ["com.acme.ATest::flakyE",
                                          "com.acme.ATest::flakyF"])
         s = flaky["com.acme.ATest::flakyF"]
+        # one run that ended green: a pass, not a failure in the rate, and
+        # one proof (a retry), not two
         self.assertEqual((s["runs"], s["passes"], s["failures"],
-                          s["same_run_flips"], s["proven"]),
-                         (1, 1, 1, 1, True))
+                          s["flake_rate"], s["same_run_flips"],
+                          s["same_commit_flips"], s["proven"]),
+                         (1, 1, 0, 0.0, 1, 0, True))
         # the never-passing one is not "failing" yet: one run < min-runs
         self.assertEqual(json.loads(out)["broken"], [])
 
@@ -225,8 +232,10 @@ class TestFailureModes(unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual(s["failure_modes"],
-                         [{"message": "timeout after Ns", "count": 4},
-                          {"message": "refused", "count": 2}])
+                         [{"message": "timeout after Ns", "count": 4,
+                           "example": "timeout after 3s"},
+                          {"message": "refused", "count": 2,
+                           "example": "refused"}])
 
     def test_report_and_history_show_the_top_failure(self):
         runs = [(f"c{i}", [res("t::x", "failed" if i % 2 else "passed",
@@ -368,6 +377,243 @@ class TestMissingDatabase(unittest.TestCase):
         code, out, err = run_cli("--db", db, "unquarantine", "--test", "t::x")
         self.assertEqual((code, out), (0, ""))
         self.assertIn("is not in quarantine; nothing changed", err)
+
+
+class TestPanelReview(unittest.TestCase):
+    """Regression tests for the eight findings of the synapse-1 panel."""
+
+    # 1. the Windows hint must never be pasteable code
+    def test_windows_quoting_refuses_shell_characters(self):
+        for tid in ["t::test[a&calc]", "t::test[%PATH%]", "t::$(id)",
+                    't::x"y', "t::a!b", "t::`b`", "t::a\\", "t::a^b|c",
+                    f"t::a{ESC}"]:
+            self.assertIsNone(safe_mod.shell_arg(tid, windows=True), tid)
+        self.assertEqual(safe_mod.shell_arg("t.m::test_x[1-2 a,b]",
+                                            windows=True),
+                         '"t.m::test_x[1-2 a,b]"')
+
+    def test_windows_report_hint_falls_back_to_a_command_without_the_id(self):
+        tid = "t::test[a&calc]"
+        runs = [(f"c{i}", [res(tid, "passed")]) for i in range(12)]
+        db = db_with(runs)
+        conn = store_mod.connect(db)
+        store_mod.quarantine_add(conn, tid)
+        conn.close()
+        with mock.patch.object(safe_mod, "_WINDOWS", True):
+            _, out, _ = run_cli("--db", db, "report")
+        hint = next(ln for ln in out.splitlines() if "run: " in ln)
+        self.assertNotIn("calc", hint)
+        self.assertIn("flakebox unquarantine --all-stable --stable-runs 10",
+                      hint)
+        code, out, _ = run_cli("--db", db, "unquarantine", "--all-stable")
+        self.assertEqual(code, 0)
+        self.assertIn("un-quarantined 1 stable test(s)", out)
+        conn = store_mod.connect(db)
+        self.assertFalse(store_mod.is_quarantined(conn, tid))
+        conn.close()
+
+    def test_all_retired_releases_only_retired_quarantined_tests(self):
+        runs = [(f"c{i}", [res("t::gone", "failed" if i % 2 else "passed"),
+                           res("t::live", "passed")]) for i in range(6)]
+        runs += [(f"d{i}", [res("t::live", "passed")]) for i in range(3)]
+        db = db_with(runs)
+        conn = store_mod.connect(db)
+        store_mod.quarantine_add(conn, "t::gone")
+        store_mod.quarantine_add(conn, "t::live")
+        conn.close()
+        _, out, _ = run_cli("--db", db, "unquarantine", "--all-retired")
+        self.assertIn("un-quarantined 1 retired test(s)", out)
+        conn = store_mod.connect(db)
+        self.assertEqual([q["test_id"] for q in store_mod.quarantined(conn)],
+                         ["t::live"])
+        conn.close()
+
+    # 2. history escapes the outcome, and import refuses unknown outcomes
+    def test_import_refuses_an_unknown_outcome(self):
+        tmp = mktemp()
+        p = os.path.join(tmp, "evil.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"flakebox_export": 1, "runs": [{
+                "commit": "c", "results": [
+                    ["t::a", f"{ESC}]0;pwned\x07{ESC}[2Jfailed", 1, ""]]}]}, f)
+        code, out, err = run_cli("--db", os.path.join(tmp, "d.db"),
+                                 "import", p)
+        self.assertEqual(code, 2)
+        self.assertIn("(outcome) is not one of", err)
+        self.assertNotIn(ESC, err)
+
+    def test_history_escapes_a_stored_outcome(self):
+        db = db_with([("c1", [res("t::a", "passed")])])
+        conn = store_mod.connect(db)
+        conn.execute("UPDATE results SET outcome = ?",
+                     (f"{ESC}[2Jfailed{RLO}",))
+        conn.commit()
+        conn.close()
+        _, out, _ = run_cli("--db", db, "history", "--test", "t::a")
+        self.assertNotIn(ESC, out)
+        self.assertNotIn(RLO, out)
+        self.assertIn("\\x1b[2Jfailed", out)
+
+    # 3. same-commit proof: per environment, never within one run
+    def test_a_platform_failure_is_not_proof_when_env_differs(self):
+        db = db_with([("abc", "linux", [res("t::paths", "passed")]),
+                      ("abc", "windows", [res("t::paths", "failed")])])
+        conn = store_mod.connect(db)
+        try:
+            self.assertEqual(detect_mod.analyze(conn)["flaky"], [])
+            s = detect_mod.summarize(conn, "t::paths")
+            self.assertEqual(s["same_commit_flips"], 0)
+        finally:
+            conn.close()
+        # the same environment twice is proof
+        db = db_with([("abc", "linux", [res("t::paths", "passed")]),
+                      ("abc", "linux", [res("t::paths", "failed")])])
+        conn = store_mod.connect(db)
+        try:
+            self.assertEqual(len(detect_mod.analyze(conn)["flaky"]), 1)
+        finally:
+            conn.close()
+
+    def test_duplicate_ids_in_one_run_prove_nothing(self):
+        db = db_with([("abc", [res("Suite::renders", "passed"),
+                               res("Suite::renders", "failed")])])
+        conn = store_mod.connect(db)
+        try:
+            self.assertEqual(detect_mod.analyze(conn)["flaky"], [])
+        finally:
+            conn.close()
+
+    def test_record_env_flag_and_matrix_import(self):
+        tmp = mktemp()
+        ok = os.path.join(tmp, "ok.xml")
+        bad = os.path.join(tmp, "bad.xml")
+        with open(ok, "w", encoding="utf-8") as f:
+            f.write('<testsuite><testcase classname="t" name="p"/></testsuite>')
+        with open(bad, "w", encoding="utf-8") as f:
+            f.write('<testsuite><testcase classname="t" name="p">'
+                    '<failure message="x"/></testcase></testsuite>')
+        a, b, agg = (os.path.join(tmp, n) for n in ("a.db", "b.db", "m.db"))
+        run_cli("--db", a, "record", "--junit", ok, "--commit=abc",
+                "--env=linux")
+        run_cli("--db", b, "record", "--junit", bad, "--commit=abc",
+                "--env=windows")
+        for db in (a, b):
+            run_cli("--db", db, "export", "--out", db + ".json")
+        run_cli("--db", agg, "import", a + ".json", b + ".json")
+        code, out, _ = run_cli("--db", agg, "quarantine", "--format", "json")
+        self.assertEqual(json.loads(out)["quarantined"], [])
+        _, out, _ = run_cli("--db", agg, "history", "--test", "t::p")
+        self.assertIn("[windows]", out)
+
+    def test_same_report_in_two_environments_is_two_runs(self):
+        tmp = mktemp()
+        p = os.path.join(tmp, "r.xml")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('<testsuite><testcase classname="t" name="p"/></testsuite>')
+        db = os.path.join(tmp, "h.db")
+        run_cli("--db", db, "record", "--junit", p, "--commit=c", "--env=a")
+        _, out, _ = run_cli("--db", db, "record", "--junit", p, "--commit=c",
+                            "--env=b")
+        self.assertIn("recorded run 2", out)
+        _, out, _ = run_cli("--db", db, "record", "--junit", p, "--commit=c",
+                            "--env=b")
+        self.assertIn("already recorded as run 2", out)
+
+    def test_action_passes_an_env_to_record(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "action.yml"), encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn('--env="${FB_ENV:-$FB_DB_KEY-$FB_RUNNER_OS}"', text)
+        self.assertIn("  env:\n    description:", text)
+
+    # 4. the normaliser keeps the numbers that tell failures apart
+    def test_signature_keeps_status_codes_and_identifiers(self):
+        sig = detect_mod.failure_signature
+        self.assertNotEqual(sig("assert 404 == 200"), sig("assert 500 == 200"))
+        self.assertNotEqual(sig("HTTP 503"), sig("HTTP 401"))
+        self.assertNotEqual(sig("KeyError: user_1"), sig("KeyError: user_2"))
+        self.assertNotEqual(sig("test_py39 broke"), sig("test_py312 broke"))
+        self.assertEqual(sig("Read timed out after 3000 ms"),
+                         sig("Read timed out after 2950 ms"))
+        self.assertEqual(sig("refused: localhost:5432"),
+                         sig("refused: localhost:6543"))
+        self.assertEqual(sig("job 123e4567-e89b-12d3-a456-426614174000 lost"),
+                         "job N lost")
+        self.assertEqual(sig("request 1234567 failed"), "request N failed")
+
+    # 5. one retry run is one proof, ends green, and is not a red run
+    def test_a_single_retry_run_is_one_proof_and_zero_rate(self):
+        conn = store_mod.connect(db_with(
+            [("c1", [res("t::r", "passed_on_rerun", "flap")])]))
+        try:
+            s = detect_mod.analyze(conn)["flaky"][0]
+        finally:
+            conn.close()
+        self.assertEqual((s["same_run_flips"], s["same_commit_flips"],
+                          s["failures"], s["passes"], s["flake_rate"]),
+                         (1, 0, 0, 1, 0.0))
+        _, out, _ = run_cli("--db", db_with(
+            [("c1", [res("t::r", "passed_on_rerun", "flap")])]), "report")
+        row = next(ln for ln in out.splitlines() if ln.startswith("| `t::r"))
+        self.assertIn("| passed on retry |", row)
+        self.assertNotIn("same commit", row)
+
+    # 6. an id with `|` gets a hint that works
+    def test_pipe_id_hint_needs_no_id(self):
+        tid = "t::test_x[a|b]"
+        db = db_with([(f"c{i}", [res(tid, "passed")]) for i in range(12)])
+        conn = store_mod.connect(db)
+        store_mod.quarantine_add(conn, tid)
+        conn.close()
+        _, out, _ = run_cli("--db", db, "report")
+        hint = next(ln for ln in out.splitlines() if "run: " in ln)
+        self.assertNotIn("\\|", hint)
+        self.assertIn("--all-stable", hint)
+
+    # 7. a zero-byte or foreign SQLite file is refused, and left untouched
+    def test_zero_byte_and_foreign_databases_are_refused(self):
+        import sqlite3
+        tmp = mktemp()
+        zero = os.path.join(tmp, "zero.db")
+        open(zero, "wb").close()
+        foreign = os.path.join(tmp, "other.db")
+        c = sqlite3.connect(foreign)
+        c.execute("CREATE TABLE notes (x)")
+        c.commit()
+        c.close()
+        for db, why in ((zero, "the file is empty"),
+                        (foreign, "no flakebox tables")):
+            before = open(db, "rb").read()
+            for args in (["report"], ["history", "--test", "t::x"],
+                         ["export", "--out", os.path.join(tmp, "e.json")],
+                         ["quarantine", "--format", "json"],
+                         ["unquarantine", "--test", "t::x"]):
+                code, out, err = run_cli("--db", db, *args)
+                self.assertEqual(code, 2, (db, args, out))
+                self.assertIn("is not a flakebox database", err)
+                self.assertIn(why, err)
+            self.assertEqual(open(db, "rb").read(), before, db)
+        # record still creates its tables in an empty file (a writer)
+        code, _, _ = run_cli("--db", zero, "record", "--junit",
+                             self._report(tmp), "--commit=c")
+        self.assertEqual(code, 0)
+
+    def _report(self, tmp):
+        p = os.path.join(tmp, "r.xml")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('<testsuite><testcase classname="t" name="p"/></testsuite>')
+        return p
+
+    # 8. flakyError without a message falls back to the exception type
+    def test_flaky_error_without_message_uses_the_type(self):
+        xml = b"""<testsuite><testcase classname="c.T" name="t">
+  <flakyError type="java.lang.NullPointerException">
+    <stackTrace>java.lang.NullPointerException
+	at c.T.t(T.java:5)</stackTrace>
+  </flakyError></testcase></testsuite>"""
+        (r,) = junit_mod.parse_bytes(xml, "s.xml")
+        self.assertEqual((r["outcome"], r["message"]),
+                         ("passed_on_rerun", "java.lang.NullPointerException"))
 
 
 class TestVersion(unittest.TestCase):

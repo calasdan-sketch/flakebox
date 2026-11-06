@@ -32,11 +32,13 @@ one Maven Surefire test needed its built-in retry in both runs):
 ## Flaky (pass AND fail - quarantine candidates)
 | test | flake rate | fails/passes | runs | proof | top failure |
 |---|---|---|---|---|---|
-| `com.acme.CartTest::checkout` | 100% | 2/2 | 2 | same commit, passed on retry x2 | expected: N but was: N |
 | `tests.test_api::test_login` | 50% | 1/1 | 2 | same commit | ConnectionError: port N refused after Ns |
+| `com.acme.CartTest::checkout` | 0% | 0/2 | 2 | passed on retry x2 | expected: 200 but was: 503 |
 ```
 
-Two runs were enough: the same code gave both answers, so no amount of
+(`checkout` never ended red - its rate is 0% - but the runner had to
+retry it in both runs.) Two runs were enough: the same code gave both
+answers, so no amount of
 extra history could make these tests less flaky (see
 [Proof of flakiness](#proof-of-flakiness)). Without proof, a test needs
 `--min-runs` (5) executed runs before it is called flaky.
@@ -127,6 +129,12 @@ at ...`, exit 2, and no file is created (before 0.5.0 it created an empty
 one and reported "No flaky tests detected"). `record` and `import` create
 it. A database with no runs in it says `No runs recorded yet`.
 `unquarantine` of a test that is not quarantined says so on stderr.
+`unquarantine --all-stable` / `--all-retired` release every quarantined
+test the report would list as stable / retired (they take the same
+threshold options as `report`). A read command also refuses a `--db` that
+exists but is not flakebox's: a zero-byte file or another program's
+SQLite database is `error: ... is not a flakebox database`, exit 2, and is
+left untouched (it is opened read-only to check).
 
 `flakebox record` hashes the report: recording the same file for the
 same commit twice says `already recorded as run N` and adds nothing
@@ -266,9 +274,10 @@ into a DB never makes old runs look recent.
 - Everything else (always passing, or too few executed runs) is not
   reported.
 
-The flake rate is the share of executed runs in which the test failed at
-least once (a run that needed a retry counts); the `runs` column is
-executed runs. History lives in SQLite (`--db` to override).
+The flake rate is the share of executed runs that ended red (`failed` or
+`error`); a run that passed only on a retry ended green and is not
+counted in it, it is counted in the `proof` column instead. The `runs`
+column is executed runs. History lives in SQLite (`--db` to override).
 
 ### Proof of flakiness
 
@@ -278,14 +287,25 @@ a failing result with the same code"
 flakebox records which commit every run came from, so it can check exactly
 that, and it reads the retry evidence some runners write:
 
-- **same commit**: the test passed in one run and failed in another run
-  of the same `--commit`. A CI "re-run" of a red build gives this for free.
+- **same commit**: the test passed in one run and failed in a
+  *different* run of the same `--commit` **and the same `--env`**. A CI
+  "re-run" of a red build gives this for free. Two results inside one run
+  (a duplicate test id, e.g. jest-junit names without the file path) never
+  count, and neither do runs from different environments: a test that
+  passes on Linux and fails on Windows at one commit has a platform bug,
+  not a flake. Set `flakebox record --env NAME` on every matrix leg (the
+  Action does it for you: its `env` input defaults to
+  `<db-key>-<runner.os>`; set it per combination, such as
+  `${{ matrix.os }}-py${{ matrix.python }}`, when one OS runs several
+  Python versions). Runs recorded without `--env` share one environment.
 - **passed on retry**: Maven Surefire / Failsafe with
   `rerunFailingTestsCount` write a test that failed and then passed as a
   `<testcase>` with `<flakyFailure>` / `<flakyError>` children
   ([Surefire docs](https://maven.apache.org/surefire/maven-surefire-plugin/examples/rerun-failing-tests.html)).
-  flakebox records it as `passed_on_rerun`: one executed run that counts as
-  both a pass and a failure, and breaks a pass streak. A test that failed
+  flakebox records it as `passed_on_rerun`: one executed run that ended
+  green, so it counts as a pass and not in the flake rate, but it makes the
+  test flaky, is one `passed on retry` proof (never also a same-commit
+  one), and breaks a pass streak. A test that failed
   every retry (`<failure>` plus `<rerunFailure>`) is a plain failure.
 
 A flaky test with proof is reported (and `quarantine`d) with fewer than
@@ -302,13 +322,19 @@ then "the same commit" was not the same code. Runs recorded without
 
 ### Failure modes
 
-Each failing run's message (the `message` attribute, or the first line of
-the element's text) is folded into a signature: numbers, durations,
-ports and `0x` addresses become `N`, whitespace is collapsed, first line
-only. `timeout after 30.2s` and `timeout after 31.7s` are one mode. The
-report shows each flaky or failing test's most common mode, `history`
-lists the top three with counts (and each failed run's message), and the
-JSON has `failure_modes: [{"message", "count"}]`. It is string folding,
+Each failing run's message (the `message` attribute; else the first line
+of the element's text; else its `type`, which is what Surefire leaves for
+an exception without a message) is folded into a signature: only values
+that change from run to run become `N` - numbers with decimals or a time
+or `%` unit (`30.2s`, `3000 ms`), numbers after a `:` (ports, line
+numbers), numbers of four or more digits, `0x` addresses and UUIDs -
+whitespace is collapsed, first line only. So `timeout after 30.2s` and
+`timeout after 31.7s` are one mode, while `assert 404 == 200` and `assert
+500 == 200`, `HTTP 503` and `HTTP 401`, `user_1` and `user_2` stay
+apart. The report shows each flaky or failing test's most common mode,
+`history` lists the top three with counts (and each failed run's
+message), and the JSON has `failure_modes: [{"message", "count",
+"example"}]`, where `example` is the newest raw message of that mode. It is string folding,
 not clustering: two different stack traces with the same first line are
 one mode.
 
@@ -321,8 +347,17 @@ characters, bidi overrides and zero-width characters (`\x1b`, `\u202e`,
 another id. In the markdown report a `|` in an id is escaped (it would
 otherwise split the table cell on GitHub) and backticks get a longer code
 fence. The suggested `flakebox unquarantine --test ...` commands are
-shell-quoted, so pasting one with an id like `t::x"$(touch pwned)"` runs
-flakebox, nothing else. JSON output escapes all of this already. The
+quoted so that pasting one runs flakebox and nothing else. On POSIX
+shells that is single-quoting (`shlex.quote`), which is safe for every
+id. On Windows no quoting is safe in both `cmd.exe` and PowerShell for
+every character, so an id is only put in the command, in double quotes,
+when it consists of letters, digits, spaces and `_ . : / [ ] - , = + @ #
+~`. For any other id (one with `&`, `%`, `!`, `$`, a backtick, `"`, `\`),
+and on every platform for an id with `|`, a backtick or a control
+character, the report suggests a command that needs no id instead:
+`flakebox unquarantine --all-stable --stable-runs N` or `--all-retired
+--retire-after N`, which release every test the report lists in that
+section. JSON output escapes all of this already. The
 `--format deselect` line is the exception by design: it must be the exact
 ids, quoted for the shell.
 
@@ -452,10 +487,12 @@ requires it.
 - **Any DOCTYPE is refused**, harmless or not: JUnit reports never need
   one, and refusing them all keeps the XML-bomb check simple.
 - **The Action's cache steps use the `v4` tag**, not a commit SHA (above).
-- **Same-commit proof trusts `--commit`.** A placeholder commit reused for
-  different code, or a test that broke because something outside the repo
-  changed between two runs of one commit, is reported as proven flaky.
-  `--ignore-commits` turns it off.
+- **Same-commit proof trusts `--commit` and `--env`.** A placeholder
+  commit reused for different code, matrix legs recorded without distinct
+  `--env` values and then merged, or a test that broke because something
+  outside the repo changed between two runs of one commit, are reported as
+  proven flaky. `--ignore-commits` turns the proof off. Runs recorded
+  before 0.5.0 have no environment and share one.
 - **Retry proof is read from Surefire/Failsafe's `flakyFailure` /
   `flakyError` only.** Other runners' retry output (pytest-rerunfailures,
   jest `retryTimes`, ...) is not recognised as a retry; whatever they write

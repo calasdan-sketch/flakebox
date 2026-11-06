@@ -675,7 +675,8 @@ class TestActionShellInjection(unittest.TestCase):
             context = {e: value for e in (
                 "inputs.junit", "inputs.min-runs", "inputs.quarantine-output",
                 "inputs.export-output", "github.sha", "github.ref_name",
-                "github.action_path", "steps.report.outputs.new_flaky")}
+                "github.action_path", "steps.report.outputs.new_flaky",
+                "inputs.env", "inputs.db-key", "runner.os")}
             for step in self.run_steps():
                 env = {"PATH": shims + os.pathsep + os.environ.get("PATH", ""),
                        "HOME": _fake_home, "FB_SHIM_LOG": log,
@@ -703,7 +704,7 @@ class TestActionShellInjection(unittest.TestCase):
             self.assertEqual(calls, [
                 ["pip", "install", value],
                 ["python3", "-m", "flakebox", "record", f"--junit={value}",
-                 f"--commit={value}", f"--branch={value}"],
+                 f"--commit={value}", f"--branch={value}", f"--env={value}"],
                 ["python3", "-m", "flakebox", "report", f"--min-runs={value}"],
                 ["python3", "-m", "flakebox", "report", "--format", "json",
                  f"--min-runs={value}"],
@@ -786,7 +787,9 @@ class TestActionOptionValues(unittest.TestCase):
         os.chmod(os.path.join(shims, "python3"), 0o755)
         write_raw(work, "-report.xml", JUNIT)
         context = {"inputs.junit": "-report.xml", "github.sha": "-c0ffee",
-                   "github.ref_name": "-x", "inputs.export-output": "-out.json"}
+                   "github.ref_name": "-x", "inputs.export-output": "-out.json",
+                   "inputs.env": "", "inputs.db-key": "-fb",
+                   "runner.os": "Linux"}
         steps = {s["name"]: s for s in action_steps(action_text())}
 
         def run(name: str):
@@ -807,10 +810,12 @@ class TestActionOptionValues(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         conn = store_mod.connect(os.path.join(home, ".flakebox", "history.db"))
         try:
-            rows = conn.execute("SELECT commit_sha, branch FROM runs").fetchall()
+            rows = conn.execute(
+                "SELECT commit_sha, branch, env FROM runs").fetchall()
         finally:
             conn.close()
-        self.assertEqual(rows, [("-c0ffee", "-x")])
+        # an empty `env` input falls back to "<db-key>-<runner.os>"
+        self.assertEqual(rows, [("-c0ffee", "-x", "-fb-Linux")])
         with open(os.path.join(work, "-out.json"), encoding="utf-8") as f:
             self.assertEqual(len(json.load(f)["runs"]), 1)
 
@@ -1525,33 +1530,6 @@ class TestStorePragmas(unittest.TestCase):
             conn.close()
 
 
-def _reference_signature(message):
-    """Independent re-statement of detect.failure_signature()."""
-    lines = [ln for ln in (message or "").split("\n") if ln.strip()]
-    if not lines:
-        return "(no message)"
-    out, i, line = [], 0, lines[0]
-    while i < len(line):
-        if line.startswith("0x", i) and i + 2 < len(line) and \
-                line[i + 2] in "0123456789abcdefABCDEF":
-            i += 2
-            while i < len(line) and line[i] in "0123456789abcdefABCDEF":
-                i += 1
-            out.append("N")
-        elif line[i].isdigit() and line[i].isascii():
-            while i < len(line) and (
-                    (line[i].isdigit() and line[i].isascii())
-                    or (line[i] in ".," and i + 1 < len(line)
-                        and line[i + 1].isdigit() and line[i + 1].isascii())):
-                i += 1
-            out.append("N")
-        else:
-            out.append(line[i])
-            i += 1
-    sig = " ".join("".join(out).split())
-    return sig[:160] if sig else "(no message)"
-
-
 def reference_analyze(conn, min_runs=5, stable_runs=10, window=50,
                       retire_after=3, use_commits=True):
     """Independent per-test (N+1) implementation of the detection rules
@@ -1566,6 +1544,7 @@ def reference_analyze(conn, min_runs=5, stable_runs=10, window=50,
         key=lambda r: (never if r[1] is None else r[1], r[0]), reverse=True)
     rank = {run_id: n for n, (run_id, _) in enumerate(newest_first)}
     commit_of = dict(conn.execute("SELECT id, commit_sha FROM runs"))
+    env_of = dict(conn.execute("SELECT id, env FROM runs"))
     recent = [run_id for run_id, _ in newest_first[:max(retire_after, 0)]]
     all_ids = [r[0] for r in conn.execute(
         "SELECT DISTINCT test_id FROM results ORDER BY rowid")]
@@ -1580,8 +1559,8 @@ def reference_analyze(conn, min_runs=5, stable_runs=10, window=50,
         last_run = seen[0][1]
         outcomes = [o for _, _, o, _ in seen]
         reruns = outcomes.count("passed_on_rerun")
-        passes = outcomes.count("passed") + reruns
-        fails = sum(1 for o in outcomes if o in ("failed", "error")) + reruns
+        passes = outcomes.count("passed") + reruns   # a retry ended green
+        fails = sum(1 for o in outcomes if o in ("failed", "error"))
         skips = outcomes.count("skipped")
         streak = 0
         for o in outcomes:
@@ -1593,21 +1572,28 @@ def reference_analyze(conn, min_runs=5, stable_runs=10, window=50,
             "passed", "failed", "error", "passed_on_rerun"))
         flips = 0
         if use_commits:
-            for c in {commit_of[r] for _, r, _, _ in seen} - {None, ""}:
-                at_c = [o for _, r, o, _ in seen if commit_of[r] == c]
-                ok = any(o in ("passed", "passed_on_rerun") for o in at_c)
-                bad = any(o in ("failed", "error", "passed_on_rerun")
-                          for o in at_c)
-                flips += ok and bad
-        counts = {}
+            keys = {(commit_of[r], env_of[r]) for _, r, _, _ in seen
+                    if commit_of[r] not in (None, "")}
+            for key in keys:
+                runs_of = [(r, o) for _, r, o, _ in seen
+                           if (commit_of[r], env_of[r]) == key]
+                ok = {r for r, o in runs_of if o == "passed"}
+                bad = {r for r, o in runs_of if o in ("failed", "error")}
+                # a pass in one run and a failure in ANOTHER run
+                flips += any(a != b for a in ok for b in bad)
+        counts, examples = {}, {}
         for _, _, o, msg in seen:
             if o in ("failed", "error", "passed_on_rerun"):
-                sig = _reference_signature(msg)
+                sig = detect_mod.failure_signature(msg)
                 counts[sig] = counts.get(sig, 0) + 1
+                first = [ln.strip() for ln in (msg or "").splitlines()
+                         if ln.strip()]
+                examples.setdefault(sig, first[0][:160] if first else "")
         modes = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
         recovered = streak >= stable_runs
-        status = ("recovered" if passes and fails and recovered
-                  else "flaky" if passes and fails else "failing" if fails
+        mixed = passes and (fails or reruns)
+        status = ("recovered" if mixed and recovered
+                  else "flaky" if mixed else "failing" if fails
                   else "passing" if passes else "unknown")
         s = {"runs": executed, "recorded": len(outcomes), "passes": passes,
              "failures": fails, "skips": skips,
@@ -1615,7 +1601,8 @@ def reference_analyze(conn, min_runs=5, stable_runs=10, window=50,
              "pass_streak": streak, "status": status,
              "same_run_flips": reruns, "same_commit_flips": flips,
              "proven": bool(reruns or flips),
-             "failure_modes": [{"message": m, "count": c} for m, c in modes],
+             "failure_modes": [{"message": m, "count": c,
+                                "example": examples[m]} for m, c in modes],
              "test_id": tid,
              "quarantined": store_mod.is_quarantined(conn, tid)}
         if recent and last_run not in recent:

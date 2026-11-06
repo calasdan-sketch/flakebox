@@ -69,9 +69,20 @@ def _existing_db(path: str | None):
     a mistyped --db and answer "No flaky tests detected" - a gate that
     passes because it looked in the wrong place. Now that is an error."""
     path = path or default_db()
-    if path != ":memory:" and not os.path.exists(path):
-        raise _NoDatabase(path)
+    if path != ":memory:":
+        if not os.path.exists(path):
+            raise _NoDatabase(path)
+        try:
+            # a zero-byte file or another program's SQLite database would
+            # be given flakebox's schema and reported as "no runs"
+            store_mod.check_existing(path)
+        except store_mod.NotFlakeboxDB as e:
+            raise _NotFlakebox(path, str(e)) from None
     return store_mod.connect(path)
+
+
+class _NotFlakebox(Exception):
+    """An existing file that a read command will not treat as history."""
 
 
 def _short(text: str) -> str:
@@ -151,13 +162,13 @@ def cmd_record(args) -> int:
     conn = _db(args.db)
     try:
         if not args.force:
-            dup = store_mod.find_run(conn, args.commit, sha)
+            dup = store_mod.find_run(conn, args.commit, sha, args.env)
             if dup is not None:
                 print(f"already recorded as run {dup} (same commit and "
                       f"report); nothing added. --force records it again.")
                 return 0
         run_id = store_mod.record_run(conn, results, args.commit, args.branch,
-                                      report_sha=sha)
+                                      report_sha=sha, env=args.env)
     finally:
         conn.close()
     n_fail = sum(1 for r in results if r["outcome"] in ("failed", "error"))
@@ -197,8 +208,16 @@ def _top_failure(s: dict, width: int = 60) -> str:
     return safe.md_cell(msg) + more
 
 
-def _unquarantine_cmd(test_id: str) -> str:
-    return f"flakebox unquarantine --test {safe.shell_arg(test_id)}"
+def _unquarantine_cmd(test_id: str, fallback: str) -> str:
+    """The command that releases `test_id`, for a markdown code span. When
+    the id cannot be pasted safely (shell_arg() refuses it: a Windows
+    shell character, a control character), or would be changed by the
+    code span (`|`, a backtick), the `fallback` - a command that needs no
+    id - is suggested instead."""
+    quoted = safe.shell_arg(test_id)
+    if quoted is None or "|" in test_id or "`" in test_id:
+        return fallback
+    return f"flakebox unquarantine --test {quoted}"
 
 
 def cmd_report(args) -> int:
@@ -231,8 +250,9 @@ def cmd_report(args) -> int:
                   f"{_evidence(s)} | {_top_failure(s)} |")
         print()
         if any(s["proven"] for s in a["flaky"]):
-            print("_proof: the test passed and failed on the same commit, "
-                  "or failed and then passed on the runner's retry in one "
+            print("_proof: the test passed in one run and failed in "
+                  "another run of the same commit and environment, or "
+                  "failed and then passed on the runner's retry in one "
                   "run - flaky whatever the run count._\n")
     else:
         print("No flaky tests detected. \U0001f389\n")
@@ -249,14 +269,19 @@ def cmd_report(args) -> int:
         for s in a["stable"]:
             print(f"- {safe.md_code(s['test_id'])} ({s['pass_streak']} "
                   f"consecutive passes)")
-            print(f"  run: {safe.md_code(_unquarantine_cmd(s['test_id']))}")
+            hint = _unquarantine_cmd(
+                s["test_id"], f"flakebox unquarantine --all-stable "
+                f"--stable-runs {args.stable_runs}")
+            print(f"  run: {safe.md_code(hint)}")
         print()
     if a["retired"]:
         print(f"## Retired (absent from the last {args.retire_after} runs - "
               f"deleted or renamed, not counted)")
         for s in a["retired"]:
             q = (" - still quarantined, run: "
-                 + safe.md_code(_unquarantine_cmd(s["test_id"]))
+                 + safe.md_code(_unquarantine_cmd(
+                     s["test_id"], f"flakebox unquarantine --all-retired "
+                     f"--retire-after {args.retire_after}"))
                  if s["quarantined"] else "")
             print(f"- {safe.md_code(s['test_id'])} (was {s['status']}; last "
                   f"seen run {s['last_run']}, commit "
@@ -316,9 +341,27 @@ def cmd_quarantine(args) -> int:
 def cmd_unquarantine(args) -> int:
     conn = _existing_db(args.db)
     try:
-        removed = store_mod.quarantine_remove(conn, args.test)
+        if args.test is None:   # --all-stable / --all-retired
+            a = detect_mod.analyze(conn, args.min_runs, args.stable_runs,
+                                   retire_after=args.retire_after,
+                                   use_commits=not args.ignore_commits)
+            group = a["stable"] if args.all_stable else [
+                s for s in a["retired"] if s["quarantined"]]
+            released = [s["test_id"] for s in group
+                        if store_mod.quarantine_remove(conn, s["test_id"])]
+        else:
+            removed = store_mod.quarantine_remove(conn, args.test)
     finally:
         conn.close()
+    if args.test is None:
+        which = "stable" if args.all_stable else "retired"
+        print(f"un-quarantined {len(released)} {which} test(s)")
+        for tid in released:
+            print(f"  {safe.text(tid)}")
+        if released:
+            print("regenerate the pytest plugin: "
+                  "flakebox quarantine --format pytest")
+        return 0
     if not removed:
         print(f"{safe.text(args.test)} is not in quarantine; nothing "
               f"changed (flakebox quarantine --format json lists the set)",
@@ -366,7 +409,10 @@ def cmd_history(args) -> int:
             print(f"    {m['count']:>3}x {safe.text(m['message'])}")
         print()
     for h in hist[:20]:
-        line = f"  {h['outcome']:7} {safe.text(h['commit'] or '-')}"
+        # the outcome is escaped too: an imported DB is someone else's data
+        line = f"  {safe.text(h['outcome']):7} {safe.text(h['commit'] or '-')}"
+        if h.get("env"):
+            line += f" [{safe.text(h['env'])}]"
         if h["outcome"] not in ("passed", "skipped") and h.get("message"):
             msg = next((ln.strip() for ln in h["message"][:4096].splitlines()
                         if ln.strip()), "")
@@ -461,6 +507,12 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--junit", required=True)
     r.add_argument("--commit", type=_utf8, default=None)
     r.add_argument("--branch", type=_utf8, default=None)
+    r.add_argument("--env", type=_utf8, default=None, metavar="NAME",
+                   help="the environment this run is from (e.g. "
+                        "linux-py3.12). Same-commit proof only compares runs "
+                        "of one environment, so a test that passes on Linux "
+                        "and fails on Windows at one commit is not called "
+                        "flaky for that. Set it on every matrix leg.")
     r.add_argument("--force", action="store_true",
                    help="record even if this exact report (same commit, "
                         "same bytes) was recorded before")
@@ -486,8 +538,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "skip them (default) or run them as non-strict "
                         "xfail so they keep recording results")
 
-    u = sub.add_parser("unquarantine", parents=[common], help="Release a test.")
-    u.add_argument("--test", required=True, type=_utf8)
+    u = sub.add_parser("unquarantine", parents=[common, detect],
+                       help="Release a test, or every stable / retired one.")
+    which = u.add_mutually_exclusive_group(required=True)
+    which.add_argument("--test", type=_utf8, default=None)
+    which.add_argument("--all-stable", action="store_true",
+                       help="release every quarantined test the report "
+                            "lists as stable (same --stable-runs etc.)")
+    which.add_argument("--all-retired", action="store_true",
+                       help="release every quarantined test the report "
+                            "lists as retired (same --retire-after)")
 
     h = sub.add_parser("history", parents=[common, detect],
                        help="Per-test run history (same thresholds as "
@@ -555,6 +615,10 @@ def main(argv=None) -> int:
         if sys.stdout is not None:
             sys.stdout.flush()  # a closed pipe surfaces here, not at interpreter exit
         return rc
+    except _NotFlakebox as e:
+        print(f"error: {safe.text(e.args[0])} is not a flakebox database "
+              f"({safe.text(e.args[1])}); check --db", file=sys.stderr)
+        return 2
     except _NoDatabase as e:
         print(f"error: no flakebox database at {safe.text(e.args[0])} "
               f"(nothing recorded there: check --db, or run flakebox record "
