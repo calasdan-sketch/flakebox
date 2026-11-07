@@ -18,6 +18,7 @@ from flakebox import safe as safe_mod
 from flakebox import store as store_mod
 
 from tests.test_flakebox import (  # noqa: F401  (module fixtures)
+    legacy_view,
     empty_db, equivalence_history, mktemp, reference_analyze, result,
     run_cli, setUpModule, tearDownModule)
 
@@ -193,12 +194,13 @@ class TestBatchedEqualsOracleWithProof(unittest.TestCase):
             for commit, rs in equivalence_history(shared_commits=True):
                 store_mod.record_run(conn, rs, commit_sha=commit)
             kw = dict(min_runs=5, stable_runs=5, window=10)
-            a = detect_mod.analyze(conn, **kw)
+            a = legacy_view(detect_mod.analyze(conn, model="legacy", **kw))
             self.assertEqual(a, reference_analyze(conn, **kw))
             self.assertTrue(any(s["same_commit_flips"] for s in a["flaky"]))
             self.assertTrue(any(s["same_run_flips"] for s in a["flaky"]))
             self.assertTrue(any(s["failure_modes"] for s in a["flaky"]))
-            off = detect_mod.analyze(conn, use_commits=False, **kw)
+            off = legacy_view(detect_mod.analyze(
+                conn, use_commits=False, model="legacy", **kw))
             self.assertEqual(off, reference_analyze(conn, use_commits=False,
                                                     **kw))
             self.assertFalse(any(s["same_commit_flips"] for s in off["flaky"]))
@@ -233,9 +235,10 @@ class TestFailureModes(unittest.TestCase):
             conn.close()
         self.assertEqual(s["failure_modes"],
                          [{"message": "timeout after Ns", "count": 4,
-                           "example": "timeout after 3s"},
+                           "example": "timeout after 3s",
+                           "family": "timing"},
                           {"message": "refused", "count": 2,
-                           "example": "refused"}])
+                           "example": "refused", "family": "unknown"}])
 
     def test_report_and_history_show_the_top_failure(self):
         runs = [(f"c{i}", [res("t::x", "failed" if i % 2 else "passed",

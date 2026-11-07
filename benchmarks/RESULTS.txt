@@ -1,0 +1,28 @@
+flake classification: 400 simulated tests of each of 5 kinds, 60 runs each, seed 20261107
+
+metric                                         legacy     stat
+flaky recall %                                   79.9     93.5
+flaky recall, histories with a failure %         81.4     95.3
+flaky precision %                                61.5    100.0
+healthy called flaky %                            0.0      0.0
+regressions quarantined as flaky %              100.0      0.0
+regressions called regressed %                    0.0    100.0
+always-red called broken %                      100.0    100.0
+
+runs after the onset until the call is right and stays right (median; share of tests never right in brackets)
+kind                                                 legacy           stat
+late-flake                                           3 (6%)         4 (1%)
+regression                                     never (100%)         3 (0%)
+
+quarantine release (the fix lands at run 30)
+metric                                         legacy     stat
+still-flaky tests told 'release' %               35.5     15.2
+fixed tests released within 30 runs %           100.0     98.2
+fixed tests: median runs until release            9.0      9.0
+
+retries in the JUnit file (pytest-rerunfailures shape)
+metric                                         legacy     stat
+retried-green flakes seen in ONE run %            0.0    100.0
+always-red tests misread as flaky %             100.0      0.0
+
+all floors met

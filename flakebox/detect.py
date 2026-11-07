@@ -17,6 +17,12 @@ Definitions (skipped runs never count as evidence either way):
 - RECOVERED = would be flaky, but the newest ``stable_runs`` executed
             runs all passed: it has recovered and is left alone (not
             re-quarantined); ``report`` and ``history`` both say so.
+- REGRESSED = passed and failed, but the failures are a step, not a
+            scatter: the failure rate jumped at one run (a likelihood-
+            ratio scan, stat.change_point) to at least 80% and has stayed
+            there to the newest run. A real break - fix it, don't
+            quarantine it. Names the last good and first bad commit.
+            ``model="legacy"`` calls it FLAKY, as flakebox < 0.6 did.
 - FAILING = executed at least ``min_runs`` times and never passed.
             Broken, not flaky - a different problem, don't quarantine it.
 - PASSING = executed at least ``min_runs`` times and never failed.
@@ -38,10 +44,17 @@ from __future__ import annotations
 
 import re
 
+from . import rootcause
+from . import stat as stat_mod
 from . import store as store_mod
 
 FLAKY, FAILING, PASSING, UNKNOWN = "flaky", "failing", "passing", "unknown"
 RECOVERED = "recovered"
+# Passed for a long time, failing ever since: a regression, not a flake
+# (model "stat" only).
+REGRESSED = "regressed"
+MODELS = ("stat", "legacy")
+REGRESSED_AFTER = 0.8  # failure rate since the step that makes it a break
 FAIL_OUTCOMES = ("failed", "error")
 RERUN = "passed_on_rerun"  # failed then passed inside one run (see junit.py)
 RETIRE_AFTER = 3  # absent from this many newest runs -> retired
@@ -119,7 +132,8 @@ def _example(message) -> str:
 def stats(outcomes_newest_first: list[str], stable_runs: int = 0,
           commits: list | None = None,
           messages: list | None = None,
-          run_ids: list | None = None) -> dict:
+          run_ids: list | None = None, model: str = "stat",
+          max_stable: int = 50) -> dict:
     """Pass/fail/skip counts, fail rate over executed runs, the current
     pass streak (consecutive newest passes; a skip neither extends nor
     breaks it), the status from classify(), and the proof of flakiness:
@@ -194,6 +208,27 @@ def stats(outcomes_newest_first: list[str], stable_runs: int = 0,
                 else:
                     modes[sig] = [1, _example(raw)]
     ranked = sorted(modes.items(), key=lambda kv: (-kv[1][0], kv[0]))
+    # How many straight passes show a flake is gone? Ten is arbitrary: a
+    # test that failed 1 run in 10 passes ten in a row 35% of the time
+    # while still flaky. The model "stat" asks for as many passes as it
+    # would take to see the failure again with 95% confidence at the rate
+    # it had before the streak (at least `stable_runs`, at most
+    # `max_stable`, normally the window).
+    stable_needed = stable_runs
+    if model == "stat" and stable_runs and (fails or reruns):
+        before = executed - streak
+        if before > 0:
+            need = stat_mod.runs_to_catch(min((fails + reruns) / before,
+                                              0.999))
+            stable_needed = max(stable_runs, min(need or 0, max_stable))
+    status = classify(passes, fails, streak, stable_needed, reruns)
+    low, high = stat_mod.wilson(fails, executed)
+    change = None
+    proven = bool(reruns or commit_flips)
+    if model == "stat" and status == FLAKY and not proven:
+        change = _step(outcomes_newest_first, commits, run_ids)
+        if change and change["kind"] == "regression":
+            status = REGRESSED
     return {
         "runs": executed,          # executed runs (skips excluded)
         "recorded": len(outcomes_newest_first),
@@ -202,19 +237,83 @@ def stats(outcomes_newest_first: list[str], stable_runs: int = 0,
         "skips": skips,
         "flake_rate": (fails / executed) if executed else 0.0,
         "pass_streak": streak,
-        "status": classify(passes, fails, streak, stable_runs, reruns),
+        "stable_needed": stable_needed,
+        "rate_low": low,           # 95% Wilson interval of flake_rate
+        "rate_high": high,
+        "status": status,
+        "change": change,
         "same_run_flips": reruns,
         "same_commit_flips": commit_flips,
-        "proven": bool(reruns or commit_flips),
-        "failure_modes": [{"message": m, "count": c, "example": ex}
+        "proven": proven,
+        "failure_modes": [{"message": m, "count": c, "example": ex,
+                           "family": rootcause.family(ex)}
                           for m, (c, ex) in ranked[:FAILURE_MODES]],
     }
+
+
+def _step(outcomes_newest_first, commits, run_ids):
+    """Did the failure rate step? None, or {kind, ...} describing the best
+    single change point (stat.change_point) of the executed runs:
+
+    - kind "regression": the rate since the step is >= REGRESSED_AFTER and
+      higher than before (it passed, now it fails). `last_good_commit` and
+      `first_bad_commit` bracket it for a bisect; `runs_since` counts the
+      runs from the first bad one to the newest.
+    - kind "onset": the rate rose to something below that (a new flake):
+      `first_bad_commit` is the first failure after the step.
+    - kind "improvement": the rate fell (partly fixed).
+    """
+    series, keys = [], []   # oldest first, executed runs only
+    for i in range(len(outcomes_newest_first) - 1, -1, -1):
+        o = outcomes_newest_first[i]
+        if o in FAIL_OUTCOMES:
+            series.append(1)
+        elif o in ("passed", RERUN):
+            series.append(0)
+        else:
+            continue
+        key = commits[i] if commits and i < len(commits) else None
+        commit = key[0] if isinstance(key, tuple) else key
+        keys.append(commit or None)
+    cp = stat_mod.change_point(series)
+    if cp is None:
+        return None
+    at = cp["at"]
+    first_bad = next((j for j in range(at, len(series)) if series[j]), None)
+    last_good = next((j for j in range(first_bad - 1, -1, -1)
+                      if not series[j]), None) if first_bad is not None \
+        else None
+    if cp["after"] > cp["before"]:
+        kind = "regression" if cp["after"] >= REGRESSED_AFTER else "onset"
+    else:
+        kind = "improvement"
+    return {"kind": kind, "before": cp["before"], "after": cp["after"],
+            "lr": cp["lr"], "runs_before": at,
+            "runs_since": len(series) - (first_bad if first_bad is not None
+                                         else at),
+            "first_bad_commit": keys[first_bad] if first_bad is not None
+            else None,
+            "last_good_commit": keys[last_good] if last_good is not None
+            else None}
+
+
+def bucket_of(s: dict, min_runs: int = 5):
+    """The report bucket for a stats() dict: "flaky", "regressed",
+    "broken", or None (nothing to say yet: too few executed runs, passing,
+    recovered). The one place the thresholds meet the statuses, shared by
+    analyze() and benchmarks/accuracy.py."""
+    if s["status"] == FLAKY and s["proven"]:
+        return "flaky"  # proof needs no minimum number of runs
+    if s["runs"] < min_runs:
+        return None  # not enough executed runs to say anything
+    return {FLAKY: "flaky", REGRESSED: "regressed",
+            FAILING: "broken"}.get(s["status"])
 
 
 def summarize(conn, test_id: str, window: int = 50,
               retire_after: int = RETIRE_AFTER,
               stable_runs: int = STABLE_RUNS,
-              use_commits: bool = True) -> dict:
+              use_commits: bool = True, model: str = "stat") -> dict:
     """One test's stats with the same status word `report` would use
     (`flakebox history`)."""
     hist = store_mod.test_history(conn, test_id, limit=window)  # newest first
@@ -222,7 +321,8 @@ def summarize(conn, test_id: str, window: int = 50,
               commits=([(h["commit"], h["env"]) for h in hist]
                        if use_commits else None),
               messages=[h["message"] for h in hist],
-              run_ids=[h["run_id"] for h in hist])
+              run_ids=[h["run_id"] for h in hist], model=model,
+              max_stable=window)
     s["test_id"] = test_id
     s["quarantined"] = store_mod.is_quarantined(conn, test_id)
     # retire_after 0 disables retirement, as it does for analyze(): with no
@@ -235,8 +335,8 @@ def summarize(conn, test_id: str, window: int = 50,
 
 def analyze(conn, min_runs: int = 5, stable_runs: int = STABLE_RUNS,
             window: int = 50, retire_after: int = RETIRE_AFTER,
-            use_commits: bool = True) -> dict:
-    """Return {flaky: [...], broken: [...], stable: [...], retired: [...]}
+            use_commits: bool = True, model: str = "stat") -> dict:
+    """Return {flaky, regressed, broken, stable, retired} ranked lists
     ranked lists.
 
     Single batched query (the most recent `window` runs per test, via
@@ -285,19 +385,25 @@ def analyze(conn, min_runs: int = 5, stable_runs: int = STABLE_RUNS,
             by_test[test_id] = ([outcome], first_seen, run_id, at,
                                 [(commit, env)], [message], [run_id])
     qcur = conn.cursor()
-    qcur.execute("SELECT test_id FROM quarantine")
-    quarantined_ids = {row[0] for row in qcur.fetchall()}
+    qcur.execute("SELECT test_id, expires_at FROM quarantine")
+    quarantined_ids, expired_ids = set(), set()
+    for tid, expires in qcur.fetchall():
+        # a quarantine whose expiry has passed no longer protects the test
+        (expired_ids if store_mod.expired({"expires_at": expires})
+         else quarantined_ids).add(tid)
     recent = set(store_mod.recent_run_ids(conn, retire_after))
-    flaky, broken, stable, retired = [], [], [], []
+    flaky, regressed, broken, stable, retired = [], [], [], [], []
     last_seen_at: dict[str, int | None] = {}
     for test_id, (outcomes, _first_seen, last_run, last_at, commits,
                   messages, run_ids) in sorted(by_test.items(),
                                                key=lambda kv: kv[1][1]):
         s = stats(outcomes, stable_runs,
                   commits=commits if use_commits else None,
-                  messages=messages, run_ids=run_ids)
+                  messages=messages, run_ids=run_ids, model=model,
+                  max_stable=window)
         s["test_id"] = test_id
         s["quarantined"] = test_id in quarantined_ids
+        s["quarantine_expired"] = test_id in expired_ids
         if recent and last_run not in recent:  # none of its runs is recent
             s["retired"] = True
             s["last_run"] = last_run
@@ -305,19 +411,20 @@ def analyze(conn, min_runs: int = 5, stable_runs: int = STABLE_RUNS,
             retired.append(s)
             continue
         s["retired"] = False
-        if s["status"] == FLAKY and s["proven"]:
-            flaky.append(s)  # proof needs no minimum number of runs
-            continue
-        if s["runs"] < min_runs:
-            continue  # not enough executed runs to say anything
-        if s["status"] == FLAKY:  # classify() already set RECOVERED aside
+        which = bucket_of(s, min_runs)
+        if which == "flaky":
             flaky.append(s)
-        elif s["status"] == FAILING:
+        elif which == "regressed":
+            regressed.append(s)
+        elif which == "broken":
             broken.append(s)
-        if s["quarantined"] and s["pass_streak"] >= stable_runs:
+        if (which != "flaky" or not s["proven"]) and s["runs"] >= min_runs \
+                and s["quarantined"] \
+                and s["pass_streak"] >= s["stable_needed"]:
             stable.append(s)
     flaky.sort(key=lambda s: (not s["proven"], -s["flake_rate"],
                               -s["failures"]))
+    regressed.sort(key=lambda s: -s["change"]["runs_since"])
     broken.sort(key=lambda s: -s["failures"])
     never = float("-inf")  # a run without a timestamp is the oldest
     retired.sort(key=lambda s: (
@@ -330,5 +437,5 @@ def analyze(conn, min_runs: int = 5, stable_runs: int = STABLE_RUNS,
             [s["last_run"] for s in retired]).fetchall())
         for s in retired:
             s["last_commit"] = commits.get(s["last_run"])
-    return {"flaky": flaky, "broken": broken, "stable": stable,
-            "retired": retired}
+    return {"flaky": flaky, "regressed": regressed, "broken": broken,
+            "stable": stable, "retired": retired}

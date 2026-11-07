@@ -17,19 +17,25 @@ flakes, and tells you when they're stable enough to come back.
 from __future__ import annotations
 
 import argparse
+import datetime
 import errno
+import glob
+import hashlib
 import json
 import os
 import sqlite3
 import sys
+import time
 
 from . import detect as detect_mod
 from . import junit as junit_mod
 from . import quarantine as quar_mod
 from . import safe
+from . import stat as stat_mod
+from . import triage as triage_mod
 from . import store as store_mod
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 
 def default_db() -> str:
@@ -105,6 +111,18 @@ def _int64(text: str) -> int:
     return value
 
 
+def _days(text: str) -> int:
+    """argparse `type` for a number of days: 0..36500."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid int value: {_short(text)!r}") from None
+    if not 0 <= value <= 36500:
+        raise argparse.ArgumentTypeError("must be between 0 and 36500")
+    return value
+
+
 def _utf8(text: str) -> str:
     """argparse `type` for text that is stored in the database. A byte of
     argv that is not UTF-8 reaches Python as a lone surrogate, which SQLite
@@ -137,25 +155,48 @@ def _is_cwd(path: str) -> bool:
         return False
 
 
+def _expand(paths: list[str]) -> list[str]:
+    """`--junit a.xml b.xml`; a pattern that names no file (`reports/*.xml`
+    that the shell left alone, as cmd.exe does) is expanded here, sorted."""
+    out = []
+    for p in paths:
+        if not os.path.exists(p) and any(c in p for c in "*?["):
+            hits = sorted(glob.glob(p))
+            out.extend(hits if hits else [p])
+        else:
+            out.append(p)
+    return out
+
+
 def cmd_record(args) -> int:
-    try:
-        raw = junit_mod.read(args.junit)
-        results = junit_mod.parse_bytes(raw, args.junit)
-    except FileNotFoundError:
-        print(f"error: no such file: {safe.text(args.junit)}",
-              file=sys.stderr)
-        return 2
-    except Exception as e:
-        print(f"error: cannot parse {safe.text(args.junit)}: "
-              f"{safe.text(e)}", file=sys.stderr)
-        return 2
-    sha = junit_mod.report_sha256(raw)
+    paths = _expand(args.junit)
+    entries, pytest_style, shas = [], False, []
+    for path in paths:
+        try:
+            raw = junit_mod.read(path)
+            got, style = junit_mod.raw_entries(raw, path)
+        except FileNotFoundError:
+            print(f"error: no such file: {safe.text(path)}", file=sys.stderr)
+            return 2
+        except Exception as e:
+            print(f"error: cannot parse {safe.text(path)}: "
+                  f"{safe.text(e)}", file=sys.stderr)
+            return 2
+        entries += got
+        pytest_style = pytest_style or style
+        shas.append(junit_mod.report_sha256(raw))
+    # shards of one run are one run: a test repeated across them was retried
+    results = junit_mod.collapse(entries, pytest_style,
+                                 args.duplicate_passes_are_reruns)
+    sha = shas[0] if len(shas) == 1 else hashlib.sha256(
+        "\n".join(sorted(shas)).encode("ascii")).hexdigest()
+    shown = paths[0] if len(paths) == 1 else f"{len(paths)} reports"
     if not results and not args.allow_empty:
         # Nearly always a test step that broke. Recorded, a run with no
         # tests makes every test look absent, and three of them in a row
         # retire the whole suite. Exit 0 all the same: a build that really
         # ran no tests (docs only) is not a failure.
-        junit_mod._warn(f"{args.junit} has no test cases, so it was not "
+        junit_mod._warn(f"{shown} has no test cases, so it was not "
                         f"recorded (a test step that broke looks like this; "
                         f"--allow-empty records it anyway)")
         return 0
@@ -184,6 +225,12 @@ def _pct(f: float) -> str:
     return f"{f:.0%}"
 
 
+def _rate(s: dict) -> str:
+    """The flake rate with its 95% interval: `25% (5-70%)`."""
+    return (f"{_pct(s['flake_rate'])} "
+            f"({s['rate_low'] * 100:.0f}-{s['rate_high'] * 100:.0f}%)")
+
+
 def _evidence(s: dict) -> str:
     """Why a flaky test is certainly flaky, in a few words ("-" when the
     verdict rests on the pass/fail counts alone)."""
@@ -197,6 +244,34 @@ def _evidence(s: dict) -> str:
     return ", ".join(parts) or "-"
 
 
+def _date(epoch) -> str:
+    """UTC date of an epoch time (`-` when unknown)."""
+    try:
+        return datetime.datetime.fromtimestamp(
+            int(epoch), datetime.timezone.utc).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "-"
+
+
+def _regression(s: dict) -> str:
+    """` - failing in the last 3 runs after 40 passes; last good commit X,
+    first bad Y`: the span a bisect has to search."""
+    ch = s.get("change") or {}
+    runs_since = ch.get("runs_since", 0)
+    before = ch.get("runs_before", 0)
+    bits = [f"failing in the last {runs_since} run(s) after "
+            f"{before} mostly-passing"]
+    good, bad = ch.get("last_good_commit"), ch.get("first_bad_commit")
+    if good or bad:
+        bits.append(f"last good commit {safe.md_cell(good or '?')}, first "
+                    f"bad {safe.md_cell(bad or '?')}: bisect between them")
+    top = _top_failure(s)
+    if top != "-":
+        bits.append(top)
+    q = " (quarantined: consider releasing it)" if s.get("quarantined") else ""
+    return " - " + "; ".join(bits) + q
+
+
 def _top_failure(s: dict, width: int = 60) -> str:
     modes = s.get("failure_modes") or []
     if not modes:
@@ -205,7 +280,9 @@ def _top_failure(s: dict, width: int = 60) -> str:
     if len(msg) > width:
         msg = msg[:width - 3] + "..."
     more = f" (+{len(modes) - 1} more)" if len(modes) > 1 else ""
-    return safe.md_cell(msg) + more
+    fam = modes[0].get("family")
+    tag = f"[{fam}] " if fam and fam != "unknown" else ""
+    return tag + safe.md_cell(msg) + more
 
 
 def _unquarantine_cmd(test_id: str, fallback: str) -> str:
@@ -225,8 +302,11 @@ def cmd_report(args) -> int:
     try:
         a = detect_mod.analyze(conn, args.min_runs, args.stable_runs,
                                retire_after=args.retire_after,
-                               use_commits=not args.ignore_commits)
+                               use_commits=not args.ignore_commits,
+                               model=args.model)
         n_runs = store_mod.run_count(conn)
+        a["quarantine_expired"] = [
+            e for e in store_mod.quarantined(conn) if store_mod.expired(e)]
     finally:
         conn.close()
     if args.format == "json":
@@ -245,7 +325,7 @@ def cmd_report(args) -> int:
         for s in a["flaky"]:
             q = " \U0001f512" if s["quarantined"] else ""
             print(f"| {safe.md_code(s['test_id'])}{q} | "
-                  f"{_pct(s['flake_rate'])} | "
+                  f"{_rate(s)} | "
                   f"{s['failures']}/{s['passes']} | {s['runs']} | "
                   f"{_evidence(s)} | {_top_failure(s)} |")
         print()
@@ -256,6 +336,12 @@ def cmd_report(args) -> int:
                   "run - flaky whatever the run count._\n")
     else:
         print("No flaky tests detected. \U0001f389\n")
+    if a["regressed"]:
+        print("## Regressed (was passing, failing since - a break, "
+              "not a flake: fix it, don't quarantine)")
+        for s in a["regressed"]:
+            print(f"- {safe.md_code(s['test_id'])}{_regression(s)}")
+        print()
     if a["broken"]:
         print("## Consistently failing (broken, not flaky - fix, don't quarantine)")
         for s in a["broken"]:
@@ -267,12 +353,22 @@ def cmd_report(args) -> int:
     if a["stable"]:
         print("## Stable - ready to un-quarantine")
         for s in a["stable"]:
+            need = (f"; {s['stable_needed']} needed at its old failure rate"
+                    if s["stable_needed"] > args.stable_runs else "")
             print(f"- {safe.md_code(s['test_id'])} ({s['pass_streak']} "
-                  f"consecutive passes)")
+                  f"consecutive passes{need})")
             hint = _unquarantine_cmd(
                 s["test_id"], f"flakebox unquarantine --all-stable "
                 f"--stable-runs {args.stable_runs}")
             print(f"  run: {safe.md_code(hint)}")
+        print()
+    if a["quarantine_expired"]:
+        print("## Quarantine expired (these tests run again and can fail "
+              "the build - fix them or renew)")
+        for e in a["quarantine_expired"]:
+            owner = f", owner {safe.md_cell(e['owner'])}" if e["owner"] else ""
+            print(f"- {safe.md_code(e['test_id'])} (expired "
+                  f"{_date(e['expires_at'])}{owner})")
         print()
     if a["retired"]:
         print(f"## Retired (absent from the last {args.retire_after} runs - "
@@ -294,24 +390,51 @@ def cmd_quarantine(args) -> int:
     """Quarantine the current flaky set and emit the WHOLE quarantine set
     in the requested format. Idempotent: running it again adds nothing,
     resets nothing, and still prints the full set (so a CI job can run
-    it every build)."""
+    it every build). New entries get an owner and an expiry; an entry
+    whose expiry has passed is left out of the set (the test runs again)
+    and named on stderr."""
     conn = _existing_db(args.db)
     try:
         a = detect_mod.analyze(conn, args.min_runs, args.stable_runs,
                                retire_after=args.retire_after,
-                               use_commits=not args.ignore_commits)
+                               use_commits=not args.ignore_commits,
+                               model=args.model)
+        released = []
+        if args.auto_release:
+            released = [s["test_id"] for s in a["stable"]
+                        if store_mod.quarantine_remove(conn, s["test_id"])]
+        expires = (None if args.expires_days == 0
+                   else int(time.time()) + args.expires_days * 86400)
         new = [s["test_id"] for s in a["flaky"]
                if store_mod.quarantine_add(conn, s["test_id"],
-                                           reason="auto: flaky")]
-        full = sorted(q["test_id"] for q in store_mod.quarantined(conn))
+                                           reason="auto: flaky",
+                                           owner=args.owner,
+                                           expires_at=expires)]
+        entries = store_mod.quarantined(conn)
     finally:
         conn.close()
+    active = {e["test_id"]: e for e in entries if not store_mod.expired(e)}
+    lapsed = sorted(e["test_id"] for e in entries if store_mod.expired(e))
+    full = sorted(active)
+    for tid in released:
+        print(f"released (stable): {safe.text(tid)}", file=sys.stderr)
+    if lapsed:
+        print(f"{len(lapsed)} quarantine(s) expired and are NOT in the set "
+              f"(those tests run again): "
+              + ", ".join(safe.text(t) for t in lapsed[:5])
+              + (" ..." if len(lapsed) > 5 else "")
+              + " - fix them, or flakebox renew --test ID --days N",
+              file=sys.stderr)
     summary = (f"quarantined {len(new)} new test(s); "
                f"{len(full)} in quarantine.")
     if args.format == "pytest":
         out_dir = args.out or "."
+        meta = {t: {k: v for k, v in (("owner", e["owner"]),
+                                      ("expires_at", e["expires_at"]))
+                    if v is not None} for t, e in active.items()}
         try:
-            written = quar_mod.write_pytest(out_dir, full, mode=args.mode)
+            written = quar_mod.write_pytest(out_dir, full, mode=args.mode,
+                                            entries=meta)
         except OSError as e:    # -o is a file, no permission, no such drive
             print(f"error: cannot write the pytest plugin to "
                   f"{safe.text(out_dir)}: {e.strerror or e}", file=sys.stderr)
@@ -333,8 +456,41 @@ def cmd_quarantine(args) -> int:
         print(summary, file=sys.stderr)
         _lf_only(sys.stdout)    # no CR at the end of what `$(...)` captures
         print(quar_mod.deselect_line(full))
+    elif args.format in quar_mod.RUNNER_FORMATS:
+        # stdout is the runner's arguments only, like --format deselect
+        print(summary, file=sys.stderr)
+        line, left_out = quar_mod.runner_line(args.format, full)
+        for t in left_out:
+            print(f"not expressible for {args.format}, left running: "
+                  f"{safe.text(t)}", file=sys.stderr)
+        _lf_only(sys.stdout)
+        print(line)
     else:
-        print(json.dumps({"quarantined": full, "new": new}, indent=2))
+        print(json.dumps({"quarantined": full, "new": new,
+                          "expired": lapsed,
+                          "entries": {t: {"owner": e["owner"],
+                                          "expires_at": e["expires_at"]}
+                                      for t, e in sorted(active.items())}},
+                         indent=2))
+    return 0
+
+
+def cmd_renew(args) -> int:
+    conn = _existing_db(args.db)
+    try:
+        expires = (None if args.days == 0
+                   else int(time.time()) + args.days * 86400)
+        ok = store_mod.quarantine_renew(conn, args.test, expires,
+                                        owner=args.owner)
+    finally:
+        conn.close()
+    if not ok:
+        print(f"{safe.text(args.test)} is not in quarantine; nothing "
+              f"changed", file=sys.stderr)
+        return 0
+    until = "never" if expires is None else _date(expires)
+    print(f"renewed {safe.text(args.test)}: expires {until}")
+    print("regenerate the pytest plugin: flakebox quarantine --format pytest")
     return 0
 
 
@@ -344,7 +500,8 @@ def cmd_unquarantine(args) -> int:
         if args.test is None:   # --all-stable / --all-retired
             a = detect_mod.analyze(conn, args.min_runs, args.stable_runs,
                                    retire_after=args.retire_after,
-                                   use_commits=not args.ignore_commits)
+                                   use_commits=not args.ignore_commits,
+                                   model=args.model)
             group = a["stable"] if args.all_stable else [
                 s for s in a["retired"] if s["quarantined"]]
             released = [s["test_id"] for s in group
@@ -372,6 +529,109 @@ def cmd_unquarantine(args) -> int:
     return 0
 
 
+MARKER = "<!-- flakebox:triage -->"
+
+
+def _triage_row(f: dict) -> str:
+    v = f["verdict"]
+    if v == triage_mod.KNOWN:
+        bits = [f"flake rate {_rate(f)} over {f['runs']} runs"]
+        if f["proven"]:
+            bits.append("proven (same commit or retry)")
+        if f["tracking_since"] is not None:
+            bits.append(f"tracking since {_date(f['tracking_since'])}")
+        bits.append(f"owner {safe.md_cell(f['owner'])}" if f["owner"]
+                    else "no owner")
+        if f["quarantined"]:
+            bits.append("quarantined")
+        label = "known flake"
+    elif v == triage_mod.BROKEN:
+        ch = f.get("change") or {}
+        bits = [f"already failing: {f['runs']} runs on record"]
+        if ch.get("first_bad_commit"):
+            bits.append(f"since commit {safe.md_cell(ch['first_bad_commit'])}")
+        label = "BROKEN, re-running will not help"
+    elif v == triage_mod.WEAK:
+        bits = [f"failed before, only {f['runs']} runs on record"]
+        label = "not enough history to call it a flake"
+    else:
+        bits = ["no flaky history" if f["runs"] else "never seen before"]
+        label = "NEW failure, probably real"
+    if f.get("family") and f["family"] != "unknown" and v == triage_mod.KNOWN:
+        bits.append(f"usually {f['family']}")
+    return (f"| {safe.md_code(f['test_id'])} | {label} | "
+            f"{'; '.join(bits)} |")
+
+
+def render_triage(t: dict) -> str:
+    fails = t["failures"]
+    lines = [MARKER]
+    if not fails:
+        lines.append("### Flakebox: no failures in this report")
+        if t["retried"]:
+            lines.append(f"\n{len(t['retried'])} test(s) passed only on a "
+                         f"retry: " + ", ".join(
+                             safe.md_code(x) for x in t["retried"][:10]))
+        return "\n".join(lines) + "\n"
+    known = sum(1 for f in fails if f["verdict"] == triage_mod.KNOWN)
+    lines.append(f"### Flakebox: {len(fails)} failed test(s), "
+                 f"{known} known flake(s)")
+    if t["all_known"]:
+        lines.append("\nEvery failure is a known flake. Re-running is "
+                     "reasonable; the owners are tracking them.")
+    else:
+        lines.append(f"\n**{len(fails) - known} failure(s) are not known "
+                     f"flakes - look at those first.**")
+    lines += ["", "| test | verdict | detail |", "|---|---|---|"]
+    lines += [_triage_row(f) for f in fails[:50]]
+    if len(fails) > 50:
+        lines.append(f"\n... and {len(fails) - 50} more")
+    if t["retried"]:
+        lines.append(f"\n{len(t['retried'])} more test(s) passed only on a "
+                     f"retry.")
+    lines.append("\n_From recorded history only; a verdict is a "
+                 "probability, not a proof. Source: flakebox._")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_triage(args) -> int:
+    paths = _expand(args.junit)
+    entries, pytest_style = [], False
+    for path in paths:
+        try:
+            got, style = junit_mod.raw_entries(junit_mod.read(path), path)
+        except FileNotFoundError:
+            print(f"error: no such file: {safe.text(path)}", file=sys.stderr)
+            return 2
+        except Exception as e:
+            print(f"error: cannot parse {safe.text(path)}: "
+                  f"{safe.text(e)}", file=sys.stderr)
+            return 2
+        entries += got
+        pytest_style = pytest_style or style
+    results = junit_mod.collapse(entries, pytest_style)
+    path = args.db or default_db()
+    conn = None
+    if path == ":memory:" or os.path.exists(path):
+        conn = _existing_db(args.db)   # a foreign file is still an error
+    try:
+        t = triage_mod.triage(conn, results, min_runs=args.min_runs,
+                              retire_after=args.retire_after,
+                              stable_runs=args.stable_runs,
+                              use_commits=not args.ignore_commits,
+                              model=args.model)
+    finally:
+        if conn is not None:
+            conn.close()
+    if args.format == "json":
+        print(json.dumps(t, indent=2))
+    else:
+        sys.stdout.write(render_triage(t))
+    if args.exit_code and t["failures"] and not t["all_known"]:
+        return 1
+    return 0
+
+
 def cmd_history(args) -> int:
     conn = _existing_db(args.db)
     try:
@@ -384,7 +644,8 @@ def cmd_history(args) -> int:
         s = detect_mod.summarize(conn, args.test,
                                  retire_after=args.retire_after,
                                  stable_runs=args.stable_runs,
-                                 use_commits=not args.ignore_commits)
+                                 use_commits=not args.ignore_commits,
+                                 model=args.model)
     finally:
         conn.close()
     status = s["status"]
@@ -403,10 +664,31 @@ def cmd_history(args) -> int:
     print(f"\n{safe.text(args.test)}: {status} - {s['passes']} passed, "
           f"{s['failures']} failed over {s['runs']} executed runs "
           f"({s['skips']} skipped{rate}){flags}\n")
+    if s["runs"]:
+        print(f"  {s['failures']} failure(s) in {s['runs']} runs: the rate "
+              f"is {_rate(s)} (95% interval)")
+    ch = s.get("change")
+    if ch and ch["kind"] == "regression":
+        print(f"  REGRESSION, not a flake:{_regression(s)}")
+    elif ch and ch["kind"] == "onset":
+        print(f"  the failure rate stepped from {_pct(ch['before'])} to "
+              f"{_pct(ch['after'])}; first failure after the step at commit "
+              f"{safe.text(ch['first_bad_commit'] or '?')}")
+    if s["status"] in (detect_mod.PASSING, detect_mod.RECOVERED):
+        pass
+    if s["status"] == detect_mod.PASSING and s["runs"]:
+        print(f"  never failed in {s['runs']} runs: with 95% confidence "
+              f"its failure rate is below {s['rate_high']:.0%}")
+    if s["flake_rate"] and s["status"] == detect_mod.FLAKY:
+        need = stat_mod.runs_to_catch(s["flake_rate"])
+        print(f"  at {_pct(s['flake_rate'])} a failure shows up within "
+              f"{need} runs 95% of the time")
     if s["failure_modes"]:
         print("  failure modes (numbers shown as N):")
         for m in s["failure_modes"]:
-            print(f"    {m['count']:>3}x {safe.text(m['message'])}")
+            fam = m.get("family")
+            tag = f" [{fam}]" if fam and fam != "unknown" else ""
+            print(f"    {m['count']:>3}x {safe.text(m['message'])}{tag}")
         print()
     for h in hist[:20]:
         # the outcome is escaped too: an imported DB is someone else's data
@@ -496,6 +778,15 @@ def build_parser() -> argparse.ArgumentParser:
                              "retired (deleted/renamed): listed apart, "
                              f"not counted (default {detect_mod.RETIRE_AFTER}; "
                              "0 disables)")
+    detect.add_argument("--model", choices=list(detect_mod.MODELS),
+                        default="stat",
+                        help="stat (default): a failure rate that stepped "
+                             "up at one run is a regression, not a flake, "
+                             "and a quarantine is released only after the "
+                             "passes it takes to see its old failure rate "
+                             "again. legacy: flakebox < 0.6 rules (a pass "
+                             "and a failure in the window = flaky; ten "
+                             "passes = stable)")
     detect.add_argument("--ignore-commits", action="store_true",
                         help="do not treat a pass and a failure at the same "
                              "commit as proof of flakiness (use it for a DB "
@@ -504,7 +795,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     r = sub.add_parser("record", parents=[common],
                        help="Ingest a JUnit XML report.")
-    r.add_argument("--junit", required=True)
+    r.add_argument("--junit", required=True, nargs="+", metavar="FILE",
+                   help="one or more JUnit XML reports (or patterns): "
+                        "the shards of one run are recorded as ONE run")
+    r.add_argument("--duplicate-passes-are-reruns", action="store_true",
+                   help="a test that appears twice and passed both times "
+                        "was retried (pytest reports always count so; other "
+                        "runners may repeat a name legitimately)")
     r.add_argument("--commit", type=_utf8, default=None)
     r.add_argument("--branch", type=_utf8, default=None)
     r.add_argument("--env", type=_utf8, default=None, metavar="NAME",
@@ -529,14 +826,48 @@ def build_parser() -> argparse.ArgumentParser:
 
     q = sub.add_parser("quarantine", parents=[common, detect],
                        help="Quarantine the flaky set.")
-    q.add_argument("--format", choices=["pytest", "json", "deselect"],
-                   default="pytest")
+    q.add_argument("--format",
+                   choices=["pytest", "json", "deselect",
+                            *quar_mod.RUNNER_FORMATS],
+                   default="pytest",
+                   help="pytest: a plugin that skips them; deselect / jest "
+                        "/ go / maven: the runner's own arguments on "
+                        "stdout; json: the set")
+    q.add_argument("--owner", type=_utf8, default=None, metavar="NAME",
+                   help="who answers for the tests quarantined by this "
+                        "command (shown in the plugin's summary and in "
+                        "PR comments)")
+    q.add_argument("--expires-days", type=_days, default=30, metavar="N",
+                   help="a new quarantine ends after N days and the test "
+                        "runs - and can fail the build - again (default "
+                        "30; 0 = never). flakebox renew extends one")
+    q.add_argument("--auto-release", action="store_true",
+                   help="first release every quarantined test the report "
+                        "lists as stable, so CI keeps the set honest "
+                        "without a person")
     q.add_argument("-o", "--out", default=".",
                    help="Output dir for --format pytest.")
     q.add_argument("--mode", choices=list(quar_mod.MODES), default="skip",
                    help="pytest plugin behaviour for quarantined tests: "
                         "skip them (default) or run them as non-strict "
                         "xfail so they keep recording results")
+
+    rn = sub.add_parser("renew", parents=[common],
+                        help="Extend a quarantine (or change its owner).")
+    rn.add_argument("--test", required=True, type=_utf8)
+    rn.add_argument("--days", type=_days, default=30,
+                    help="new expiry, days from now (0 = never)")
+    rn.add_argument("--owner", type=_utf8, default=None, metavar="NAME")
+
+    t = sub.add_parser("triage", parents=[common, detect],
+                       help="Is this report's failure a known flake? A "
+                            "pull-request comment from the history, run "
+                            "BEFORE flakebox record. Never changes the DB.")
+    t.add_argument("--junit", required=True, nargs="+", metavar="FILE")
+    t.add_argument("--format", choices=["markdown", "json"],
+                   default="markdown")
+    t.add_argument("--exit-code", action="store_true",
+                   help="exit 1 when any failure is NOT a known flake")
 
     u = sub.add_parser("unquarantine", parents=[common, detect],
                        help="Release a test, or every stable / retired one.")
@@ -608,6 +939,7 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     cmds = {"record": cmd_record, "report": cmd_report,
             "quarantine": cmd_quarantine, "unquarantine": cmd_unquarantine,
+            "renew": cmd_renew, "triage": cmd_triage,
             "history": cmd_history, "export": cmd_export,
             "import": cmd_import}
     try:

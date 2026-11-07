@@ -35,9 +35,15 @@ Usage: drop this file + flakebox_quarantine.json in your repo root and run
 `pytest` command does not, so it cannot import this file (if the plugin
 lives in another directory, put that directory on PYTHONPATH).
 Regenerate after `flakebox unquarantine` changes the set.
+
+Quarantine is never silent: the end of every run lists the quarantined
+tests it skipped (or ran as xfail) with their owner and expiry. An entry
+with an `expires_at` stops applying once it has passed - the test runs
+again and can fail the build - even if this file was never regenerated.
 """
 import json
 import os
+import time
 
 import pytest
 
@@ -47,6 +53,7 @@ with open(os.path.join(_HERE, "flakebox_quarantine.json"),
     _DATA = json.load(_f)
 QUARANTINED = _DATA["tests"]
 MODE = _DATA.get("mode", "skip")
+ENTRIES = _DATA.get("entries", {})  # id -> {owner, expires_at, reason}
 REASON = "quarantined: flaky per flakebox"
 
 
@@ -75,31 +82,47 @@ def _key(test_id):
 
 
 def _index(ids):
-    exact, tails = set(), set()
+    exact, tails = {}, {}
     for test_id in ids:
         key = _key(test_id)
         if key is not None:
             name, chain = key
-            exact.add(key)
-            tails.update((name, chain[i:]) for i in range(len(chain)))
+            exact.setdefault(key, test_id)
+            for i in range(len(chain)):
+                tails.setdefault((name, chain[i:]), test_id)
     return exact, tails
 
 
-# every quarantined (name, chain), and every tail of a quarantined chain
+# every quarantined (name, chain), and every tail of a quarantined chain,
+# each mapped to the quarantined id it came from
 _EXACT, _TAILS = _index(QUARANTINED)
 
 
-def _is_quarantined(nodeid):
+def _match(nodeid):
+    """The quarantined id that `nodeid` is, or None."""
     key = _key(nodeid)
     if key is None:
-        return False
+        return None
     name, chain = key
     # this chain is a tail of a quarantined one (the id was recorded with
     # more leading directories) ...
     if key in _TAILS:
-        return True
+        return _TAILS[key]
     # ... or a quarantined chain is a tail of this one (it has fewer)
-    return any((name, chain[i:]) in _EXACT for i in range(len(chain)))
+    for i in range(len(chain)):
+        hit = _EXACT.get((name, chain[i:]))
+        if hit is not None:
+            return hit
+    return None
+
+
+def _is_quarantined(nodeid):
+    return _match(nodeid) is not None
+
+
+def _expired(test_id):
+    expires = (ENTRIES.get(test_id) or {}).get("expires_at")
+    return expires is not None and expires <= time.time()
 
 
 def _marker():
@@ -108,15 +131,63 @@ def _marker():
     return pytest.mark.skip(reason=REASON)
 
 
+_APPLIED = []      # (nodeid, quarantined id) the plugin marked
+_EXPIRED = set()   # quarantined ids whose expiry had passed: they ran
+
+
 def pytest_collection_modifyitems(items):
     for item in items:
-        if _is_quarantined(item.nodeid):
-            item.add_marker(_marker())
+        qid = _match(item.nodeid)
+        if qid is None:
+            continue
+        if _expired(qid):
+            _EXPIRED.add(qid)    # the quarantine ended: the test runs
+            continue
+        item.add_marker(_marker())
+        _APPLIED.append((item.nodeid, qid))
+
+
+def _clean(text):
+    """Printable characters only: an id or an owner can come from an
+    imported file, and a terminal obeys the control characters in it."""
+    return "".join(c if c.isprintable() else "?" for c in str(text))
+
+
+def _until(qid):
+    entry = ENTRIES.get(qid) or {}
+    bits = []
+    if entry.get("owner"):
+        bits.append("owner " + _clean(entry["owner"]))
+    if entry.get("expires_at") is not None:
+        left = (entry["expires_at"] - time.time()) / 86400
+        bits.append("expires in %d day(s)" % int(left + 0.999)
+                    if left > 0 else "expired")
+    return " (" + ", ".join(bits) + ")" if bits else ""
+
+
+def pytest_terminal_summary(terminalreporter):
+    """Quarantine is never silent."""
+    if not (_APPLIED or _EXPIRED):
+        return
+    out = terminalreporter
+    out.write_sep("=", "flakebox quarantine")
+    if _APPLIED:
+        how = "ran as xfail" if MODE == "xfail" else "were skipped"
+        out.write_line("%d test(s) %s because they are quarantined as "
+                       "flaky:" % (len(_APPLIED), how))
+        for nodeid, qid in sorted(_APPLIED)[:50]:
+            out.write_line("  " + nodeid + _until(qid))
+        if len(_APPLIED) > 50:
+            out.write_line("  ... and %d more" % (len(_APPLIED) - 50))
+    for qid in sorted(_EXPIRED):
+        out.write_line("EXPIRED quarantine - ran again and can fail the "
+                       "build: " + _clean(qid) + _until(qid))
+        out.write_line("  fix it, or: flakebox renew --test <id> --days N")
 '''
 
 
 def write_pytest(out_dir: str, test_ids: list[str],
-                 mode: str = "skip") -> list[str]:
+                 mode: str = "skip", entries: dict | None = None) -> list[str]:
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
     os.makedirs(out_dir, exist_ok=True)
@@ -125,7 +196,12 @@ def write_pytest(out_dir: str, test_ids: list[str],
     ids = sorted(set(test_ids))
     with open(jp, "w", encoding="utf-8") as f:
         # no timestamp: regenerating an unchanged set writes the same bytes
-        json.dump({"tests": ids, "mode": mode, "count": len(ids)}, f, indent=2)
+        doc = {"tests": ids, "mode": mode, "count": len(ids)}
+        kept = {t: e for t, e in sorted((entries or {}).items())
+                if t in set(ids) and e}
+        if kept:    # owner / expiry, only when there are any
+            doc["entries"] = kept
+        json.dump(doc, f, indent=2)
         f.write("\n")
     written.append(jp)
     pp = os.path.join(out_dir, "flakebox_quarantine.py")
@@ -192,3 +268,94 @@ def deselect_line(test_ids: list[str]) -> str:
     if os.name == "nt":
         return subprocess.list2cmdline(args)
     return shlex.join(args)
+
+
+# ---------------------------------------------------------------------------
+# other runners: each returns (arguments, left_out). `left_out` are the ids
+# the runner cannot express; they keep RUNNING (and can fail the build) -
+# quarantine never widens to hide a test nobody asked to hide.
+# ---------------------------------------------------------------------------
+
+_REGEX_SPECIAL = frozenset("\\.+*?()|[]{}^$")
+
+
+def _regex_escape(text: str) -> str:
+    """Escape for a JavaScript or Go (RE2) regular expression."""
+    return "".join("\\" + c if c in _REGEX_SPECIAL else c for c in text)
+
+
+def _shell_line(args: list[str]) -> str:
+    if os.name == "nt":
+        return subprocess.list2cmdline(args)
+    return shlex.join(args)
+
+
+def jest_name(test_id: str) -> str:
+    """The Jest test name inside a JUnit id. jest-junit (its default
+    templates) writes the FULL name (describe blocks + test title, joined
+    by spaces) as both the classname and the name: `cart adds::cart
+    adds`. When the two halves are equal the name is one of them; any
+    other shape is taken as `classname::name`."""
+    n = len(test_id)
+    for i in range(n):
+        if test_id.startswith("::", i):
+            left, right = test_id[:i], test_id[i + 2:]
+            if left == right:
+                return left
+    return test_id.rpartition("::")[2]
+
+
+def jest_args(test_ids: list[str]) -> tuple[list[str], list[str]]:
+    """`--testNamePattern=^(?!(?:name1|name2)$)`: Jest runs every test
+    whose full name is NOT one of the quarantined ones, and reports the
+    others as skipped (they are counted, not hidden)."""
+    names = sorted({jest_name(t) for t in test_ids if t})
+    if not names:
+        return [], []
+    alt = "|".join(_regex_escape(n) for n in names)
+    return [f"--testNamePattern=^(?!(?:{alt})$)"], []
+
+
+def go_args(test_ids: list[str]) -> tuple[list[str], list[str]]:
+    """`-skip '^(?:TestA|TestB)$'` (Go 1.20+). The go tool matches the
+    pattern against test names without the package, and allows one -skip,
+    so only top-level tests can be listed: a subtest id (`TestA/case`) is
+    left out and keeps running."""
+    names, left_out = set(), []
+    for t in sorted(set(test_ids)):
+        name = t.rpartition("::")[2]
+        if not name or "/" in name or not name.isidentifier():
+            left_out.append(t)
+        else:
+            names.add(name)
+    if not names:
+        return [], left_out
+    alt = "|".join(sorted(names))
+    return ["-skip", f"^(?:{alt})$"], left_out
+
+
+def maven_args(test_ids: list[str]) -> tuple[list[str], list[str]]:
+    """`-Dtest=!pkg.Class#method,...` (Maven Surefire 2.19+ exclusion
+    syntax). A name that is not a plain method name (a parameterised case
+    such as `test[1]`) cannot be excluded alone and is left out."""
+    parts, left_out = [], []
+    for t in sorted(set(test_ids)):
+        cls, sep, name = t.rpartition("::")
+        name = name[:-2] if name.endswith("()") else name
+        ok = (bool(sep) and bool(cls) and bool(name)
+              and name.replace("_", "a").replace("$", "a").isalnum()
+              and all(c.isalnum() or c in "._$" for c in cls))
+        if ok:
+            parts.append(f"!{cls}#{name}")
+        else:
+            left_out.append(t)
+    return ([f"-Dtest={','.join(parts)}"] if parts else []), left_out
+
+
+RUNNER_FORMATS = {"jest": jest_args, "go": go_args, "maven": maven_args}
+
+
+def runner_line(fmt: str, test_ids: list[str]) -> tuple[str, list[str]]:
+    """(shell line, left_out) for `--format jest|go|maven`."""
+    args, left_out = RUNNER_FORMATS[fmt](test_ids)
+    return _shell_line(args), left_out

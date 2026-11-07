@@ -43,6 +43,62 @@ extra history could make these tests less flaky (see
 [Proof of flakiness](#proof-of-flakiness)). Without proof, a test needs
 `--min-runs` (5) executed runs before it is called flaky.
 
+## New in 0.6.0 (unreleased): the numbers
+
+Re-run it: `python benchmarks/accuracy.py --check` (seeded, about 10 s,
+output committed in `benchmarks/RESULTS.txt`). 400 simulated tests of each
+kind with known ground truth, 60 runs each; "legacy" is the 0.5 rule (a
+pass and a failure in the window = flaky, ten passes = stable).
+
+| | legacy | 0.6 |
+|---|---|---|
+| flake precision (called flaky and is) | 61.5% | 100% |
+| real regressions quarantined as flaky | 100% | 0% |
+| regressions named as a break | 0% | 100%, after a median of 3 runs |
+| flaky recall (any rate 2-50%) | 79.9% | 93.5% |
+| still-flaky quarantined tests told "release" | 35.5% | 15.2% |
+| retry-masked flake (pytest-rerunfailures) seen in one run | 0% | 100% |
+| always-red test with `--reruns` misread as flaky | 100% | 0% |
+
+What the table does not say: it is a simulation, so it shows the rules
+separate the cases, not how common each case is in your suite. A flake
+that starts with a long streak of failures looks like a break until a
+pass arrives (median 4 runs to the right label vs 3 before). A flake under
+about 6% cannot be shown fixed inside the 50-run window, which is why 15%
+of still-flaky tests are still told "release".
+
+- **Break vs flake.** A failure rate that stepped up at one run and stayed
+  high is `regressed`, with the last good and first bad commit to bisect
+  between; it is never auto-quarantined. `--model legacy` restores 0.5.
+  Rates carry a 95% Wilson interval (`25% (5-70%)`).
+- **Release needs evidence.** A quarantined test is "stable" after as many
+  passes as it takes to see its old failure rate again (at least
+  `--stable-runs`, at most the window).
+- **Retries in the file.** pytest-rerunfailures writes failed attempts as
+  bare `<testcase>` elements (checked against 16.7); gotestsum
+  `--rerun-fails` writes a failure then a pass. Both are now read as a
+  retry, an always-red test is one failure, and `record --junit a.xml
+  b.xml` merges shards into one run.
+- **Quarantine with an owner and an end date.** `quarantine --owner dana
+  --expires-days 30`; an expired entry leaves the set (the test runs and
+  can fail the build) and is named; `renew`, `--auto-release`. The pytest
+  plugin lists what it skipped, with owner and expiry, at the end of every
+  run, and stops applying an expired entry even if never regenerated.
+- **Other runners.** `quarantine --format jest|go|maven|deselect` prints the
+  runner's own arguments. Checked against Jest 29 + jest-junit, Go 1.24
+  `-skip` and Surefire 3.2.5 `-Dtest=!Class#method`; ids a runner cannot
+  express (Go subtests, parameterised Java cases) are named on stderr and
+  keep running. Note Surefire leaves excluded tests out of its XML.
+- **`flakebox triage --junit report.xml`** (run before `record`): per failed
+  test, "known flake, rate 12% (6-22%), owner X, tracking since D" or "NEW
+  failure, probably real" or "BROKEN". Markdown with a hidden marker for a
+  PR comment, `--format json`, `--exit-code`. The Action runs it into the
+  job summary (`triage-output` writes the comment body; posting it is your
+  step, with a token you trust, not on fork code).
+- A rough root-cause family (`network`, `timing`, `resource`,
+  `concurrency`, `shared-state`, `time-or-random`) from the message text:
+  a hint, `unknown` when nothing matches.
+
 ## How it compares
 
 Only what each project documents; follow the links. "—" means the linked
@@ -58,7 +114,11 @@ page does not describe it, not that it is impossible.
 | Quarantine that keeps running tests | yes (`--mode xfail`) | yes | yes | Buildkite Pipelines only | yes (guard list) | n/a |
 | Leaves quarantine when fixed | tells you (stable streak) | configurable recovery period | yes ("Fixed" state) | — | TTL expiry | n/a |
 | Failure grouping | normalized messages | AI clustering by stack trace | AI root-cause categories | — | — | — |
-| Ticketing, PR comments, dashboards | no | yes | yes | yes | Slack, annotations | no |
+| Tells a new break from a flake | yes (change point) | "broken" tests defined; onset not described | — | — | — | n/a |
+| Confidence interval on the rate | yes (Wilson) | not mentioned | — | — | — | n/a |
+| Quarantine owner and expiry | yes | not mentioned | — | — | TTL expiry | n/a |
+| PR comment on a failure | text for your own step | yes (comments on flaky failures) | yes | yes | Slack, annotations | no |
+| Ticketing, dashboards | no | yes | yes | yes | — | no |
 
 The hosted tools do much more around the workflow (PR comments, tickets,
 ownership, dashboards); flakebox is for teams that want the detection and

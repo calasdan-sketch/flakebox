@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.6.0 (unreleased)
+
+Benchmark: `python benchmarks/accuracy.py --check` (see README).
+
+### Added
+- `flakebox triage`, `renew`; `quarantine --owner --expires-days
+  --auto-release`; `quarantine --format jest|go|maven`; `record --junit`
+  takes several files or patterns; `--model stat|legacy`.
+- Status `regressed` (change-point scan), 95% Wilson intervals,
+  `stable_needed`, failure-mode `family`; JSON gains `regressed`,
+  `rate_low/high`, `change`, `quarantine_expired`.
+- Quarantine table: `owner`, `expires_at` (migrated; old entries never
+  expire). Export/import carry them. The pytest plugin prints a summary
+  of everything it quarantined and ignores an expired entry.
+- Action inputs `triage`, `triage-output`.
+
+### Changed
+- Default model is `stat`: a regression is no longer listed as flaky or
+  auto-quarantined (`--model legacy` for 0.5 behaviour); a quarantined test
+  is "stable" after more than `--stable-runs` passes when its old failure
+  rate needs more.
+- A test repeated inside a report is one retried run: pytest reports (bare
+  earlier attempts), fail-then-pass anywhere. Before, an always-failing
+  test under `--reruns` read as flaky and a retried green test read as a
+  clean pass. `--duplicate-passes-are-reruns` for other runners.
+- `quarantine --format json` adds `expired` and `entries`; new quarantines
+  expire after 30 days unless `--expires-days 0`.
+
 ## 0.5.0 (unreleased)
 
 ### Added

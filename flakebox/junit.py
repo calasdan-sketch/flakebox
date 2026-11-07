@@ -120,12 +120,18 @@ def check_no_dtd(raw: bytes, path: str = "") -> None:
         pass
 
 
-def parse_bytes(raw: bytes, path: str = "", warn=_warn) -> list[dict]:
-    """Return [{test_id, outcome, duration_ms, message}] for every
-    <testcase> anywhere in the document - <testsuites>, a bare
-    <testsuite>, or suites nested in suites (surefire aggregates)."""
+def raw_entries(raw: bytes, path: str = "", warn=_warn):
+    """Every <testcase> of the document, in document order, as
+    ([{test_id, outcome, duration_ms, message}], pytest_style). The
+    entries are NOT collapsed: a runner that retries a test writes it
+    once per attempt (see collapse())."""
     check_no_dtd(raw, path)
     root = ET.fromstring(raw)
+    # pytest names its <testsuite> "pytest" (and its <testsuites> "pytest
+    # tests"). pytest ids are unique, so a repeated one is a retry.
+    pytest_style = any((ts.get("name") or "") == "pytest"
+                       for ts in root.iter("testsuite")) \
+        or (root.get("name") or "").startswith("pytest")
     results = []
     cases = [root] if root.tag == "testcase" else root.iter("testcase")
     for tc in cases:
@@ -152,7 +158,71 @@ def parse_bytes(raw: bytes, path: str = "", warn=_warn) -> list[dict]:
             outcome, message = PASSED, ""
         results.append({"test_id": tid, "outcome": outcome,
                         "duration_ms": ms, "message": message})
-    return results
+    return results, pytest_style
+
+
+def collapse(entries: list[dict], pytest_style: bool = False,
+             duplicate_passes_are_reruns: bool = False) -> list[dict]:
+    """One result per test id. A test that appears more than once in a
+    report was run more than once: the runner retried it. Entries are in
+    chronological order, and the LAST executed attempt decides the run:
+
+    - last attempt failed -> `failed`/`error` (once - not one pass and one
+      failure per attempt, which made an always-failing test look flaky);
+    - last attempt passed after an earlier failure -> `passed_on_rerun`
+      (proof of flakiness; the gotestsum --rerun-fails and Gradle
+      test-retry shapes);
+    - last attempt passed and the earlier ones look passed too ->
+      `passed_on_rerun` for pytest reports (pytest-rerunfailures writes
+      the failed attempts as bare <testcase> elements with no <failure>,
+      so the retry is only visible as a repeated id) and when
+      `duplicate_passes_are_reruns` is set; otherwise a plain pass, since
+      other runners can legitimately repeat a name (table tests).
+    A surefire `passed_on_rerun` stays one. Order of first appearance."""
+    order: list[str] = []
+    by_id: dict[str, list[dict]] = {}
+    for r in entries:
+        if r["test_id"] not in by_id:
+            order.append(r["test_id"])
+            by_id[r["test_id"]] = []
+        by_id[r["test_id"]].append(r)
+    out = []
+    for tid in order:
+        group = by_id[tid]
+        if len(group) == 1:
+            out.append(group[0])
+            continue
+        executed = [g for g in group if g["outcome"] != SKIPPED]
+        if not executed:
+            out.append(group[-1])
+            continue
+        last = executed[-1]
+        earlier_fail = next((g for g in executed[:-1]
+                             if g["outcome"] in (FAILED, ERROR,
+                                                 PASSED_ON_RERUN)), None)
+        if last["outcome"] in (FAILED, ERROR):
+            out.append(dict(last))
+        elif last["outcome"] == PASSED_ON_RERUN:
+            out.append(dict(last))
+        elif earlier_fail is not None:
+            out.append({**last, "outcome": PASSED_ON_RERUN,
+                        "message": earlier_fail["message"]})
+        elif pytest_style or duplicate_passes_are_reruns:
+            out.append({**last, "outcome": PASSED_ON_RERUN,
+                        "message": ""})
+        else:
+            out.append(dict(last))
+    return out
+
+
+def parse_bytes(raw: bytes, path: str = "", warn=_warn,
+                duplicate_passes_are_reruns: bool = False) -> list[dict]:
+    """Return [{test_id, outcome, duration_ms, message}] for every test in
+    the document - <testsuites>, a bare <testsuite>, or suites nested in
+    suites (surefire aggregates) - with retried tests collapsed to one
+    result (see collapse())."""
+    entries, pytest_style = raw_entries(raw, path, warn)
+    return collapse(entries, pytest_style, duplicate_passes_are_reruns)
 
 
 def read(path: str) -> bytes:

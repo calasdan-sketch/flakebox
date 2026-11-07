@@ -34,6 +34,24 @@ inputs:
       quarantined (acknowledged) in the history DB from the next run on.
     required: false
     default: "false"
+  triage:
+    description: >-
+      Before recording, run `flakebox triage` on the report and append it
+      to the job summary: for every failed test, whether it is a known
+      flake (rate, owner, tracking since) or a failure that looks real.
+      Informational only: it never fails the step. "false" turns it off.
+    required: false
+    default: "true"
+  triage-output:
+    description: >-
+      If set, also write the triage as a Markdown pull-request comment
+      body to this file (it starts with a hidden marker so a later run can
+      update the same comment). flakebox never posts it: do that in a
+      separate step with a token you trust. On pull requests from forks
+      the token is read-only; do not hand the comment step secrets or run
+      fork code with pull_request_target.
+    required: false
+    default: ""
   quarantine-output:
     description: >-
       If set, run `flakebox quarantine --format json` after the report
@@ -123,6 +141,22 @@ runs:
       env:
         FB_ACTION_PATH: ${{ github.action_path }}
       run: pip install "$FB_ACTION_PATH"
+
+    # Triage reads the history BEFORE this run is recorded, so a test's
+    # failure in this report is not counted as its own evidence.
+    - name: Triage failures (optional)
+      if: inputs.triage == 'true'
+      shell: bash
+      env:
+        FB_JUNIT: ${{ inputs.junit }}
+        FB_TRIAGE_OUTPUT: ${{ inputs.triage-output }}
+        FB_MIN_RUNS: ${{ inputs.min-runs }}
+      run: |
+        python3 -m flakebox triage --junit="$FB_JUNIT" --min-runs="$FB_MIN_RUNS" >> "$GITHUB_STEP_SUMMARY" || true
+        if test "$FB_TRIAGE_OUTPUT" != ""; then
+          mkdir -p -- "$(dirname -- "$FB_TRIAGE_OUTPUT")"
+          python3 -m flakebox triage --junit="$FB_JUNIT" --min-runs="$FB_MIN_RUNS" > "$FB_TRIAGE_OUTPUT" || true
+        fi
 
     - name: Record results
       shell: bash

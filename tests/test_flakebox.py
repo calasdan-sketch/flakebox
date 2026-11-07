@@ -674,7 +674,7 @@ class TestActionShellInjection(unittest.TestCase):
             output = os.path.join(work, "output.txt")
             context = {e: value for e in (
                 "inputs.junit", "inputs.min-runs", "inputs.quarantine-output",
-                "inputs.export-output", "github.sha", "github.ref_name",
+                "inputs.export-output", "inputs.triage-output", "github.sha", "github.ref_name",
                 "github.action_path", "steps.report.outputs.new_flaky",
                 "inputs.env", "inputs.db-key", "runner.os")}
             for step in self.run_steps():
@@ -703,6 +703,10 @@ class TestActionShellInjection(unittest.TestCase):
             # every hostile string arrived as exactly one argument
             self.assertEqual(calls, [
                 ["pip", "install", value],
+                ["python3", "-m", "flakebox", "triage", f"--junit={value}",
+                 f"--min-runs={value}"],
+                ["python3", "-m", "flakebox", "triage", f"--junit={value}",
+                 f"--min-runs={value}"],
                 ["python3", "-m", "flakebox", "record", f"--junit={value}",
                  f"--commit={value}", f"--branch={value}", f"--env={value}"],
                 ["python3", "-m", "flakebox", "report", f"--min-runs={value}"],
@@ -954,8 +958,9 @@ class TestQuarantineIdempotent(unittest.TestCase):
         self.assertIn("0 new", outs[1][2])
         code, out, _ = run_cli("--db", db, "quarantine", "--format", "json")
         data = json.loads(out)
-        self.assertEqual(data, {"quarantined": ["tests.test_a.TestA::test_flaky"],
-                                "new": []})
+        self.assertEqual(data["quarantined"], ["tests.test_a.TestA::test_flaky"])
+        self.assertEqual(data["new"], [])
+        self.assertEqual(data["expired"], [])
 
     def test_repeated_quarantine_against_always_failing_runner_converges(self):
         """Fake runner: `always` fails every run, `flaky` alternates,
@@ -995,7 +1000,8 @@ class TestQuarantineIdempotent(unittest.TestCase):
         conn.close()
         code, out, _ = run_cli("--db", db, "quarantine", "--format", "json")
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(out), {"quarantined": [], "new": []})
+        data = json.loads(out)
+        self.assertEqual((data["quarantined"], data["new"]), ([], []))
         # still a candidate while the streak is short
         db2 = db_from_outcomes(mktemp(), {
             "p::t": ["failed", "failed", "failed"] + ["passed"] * 9})
@@ -1631,6 +1637,27 @@ def reference_analyze(conn, min_runs=5, stable_runs=10, window=50,
             "retired": retired}
 
 
+def legacy_view(analysis):
+    """analyze() output as flakebox < 0.6 shaped it: the oracle above
+    predates the interval, the step (change point) and the failure
+    family."""
+    out = {}
+    for bucket, rows in analysis.items():
+        if bucket == "regressed":
+            assert not rows, "the legacy model never reports a regression"
+            continue
+        out[bucket] = []
+        for s in rows:
+            s = {k: v for k, v in s.items()
+                 if k not in ("rate_low", "rate_high", "change",
+                             "stable_needed", "quarantine_expired")}
+            s["failure_modes"] = [
+                {k: v for k, v in m.items() if k != "family"}
+                for m in s["failure_modes"]]
+            out[bucket].append(s)
+    return out
+
+
 EQUIVALENCE_QUARANTINED = (3, 37, 66, 99, 121, 130, 140)
 
 
@@ -1704,7 +1731,8 @@ class TestAnalyzeBatchEquivalence(unittest.TestCase):
         db = make_equivalence_db(mktemp())
         conn = store_mod.connect(db)
         try:
-            new = detect_mod.analyze(conn, **self.KW)
+            new = legacy_view(detect_mod.analyze(conn, model="legacy",
+                                                 **self.KW))
             old = reference_analyze(conn, **self.KW)
             self.assertEqual(new, old)
             # sanity: the fixture actually exercises every bucket
@@ -1713,7 +1741,8 @@ class TestAnalyzeBatchEquivalence(unittest.TestCase):
             self.assertTrue(new["stable"])
             self.assertEqual(len(new["retired"]), 7)
             # retirement is a knob: 0 disables it and everything is live
-            live = detect_mod.analyze(conn, retire_after=0, **self.KW)
+            live = legacy_view(detect_mod.analyze(
+                conn, retire_after=0, model="legacy", **self.KW))
             self.assertEqual(live["retired"], [])
             self.assertEqual(live, reference_analyze(conn, retire_after=0, **self.KW))
         finally:
@@ -1864,10 +1893,11 @@ class TestRecencyOrder(unittest.TestCase):
             for i in EQUIVALENCE_QUARANTINED:
                 store_mod.quarantine_add(conn, f"mod{i:03d}::test_{i:03d}", "auto")
             try:
-                a = detect_mod.analyze(conn, **kw)
+                a = legacy_view(detect_mod.analyze(conn, model="legacy", **kw))
                 # the batched query and the per-test oracle agree on this DB
                 self.assertEqual(a, reference_analyze(conn, **kw), name)
-                live = detect_mod.analyze(conn, retire_after=0, **kw)
+                live = legacy_view(detect_mod.analyze(
+                    conn, retire_after=0, model="legacy", **kw))
                 self.assertEqual(live, reference_analyze(
                     conn, retire_after=0, **kw), name)
                 histories[name] = {
@@ -2022,7 +2052,9 @@ class TestRetired(unittest.TestCase):
         store_mod.quarantine_add(conn, "t::gone", "auto: flaky")
         conn.close()
         code, out, _ = run_cli("--db", db, "quarantine", "--format", "json")
-        self.assertEqual(json.loads(out), {"quarantined": ["t::gone"], "new": []})
+        data = json.loads(out)
+        self.assertEqual((data["quarantined"], data["new"]),
+                         (["t::gone"], []))
         code, out, _ = run_cli("--db", db, "report")
         self.assertIn("still quarantined", out)
         self.assertIn("`flakebox unquarantine --test t::gone`", out)
@@ -2565,7 +2597,8 @@ class TestDbFlagPosition(unittest.TestCase):
         subs = next(a for a in parser._actions
                     if isinstance(a, argparse_sub_type())).choices
         self.assertEqual(sorted(subs), ["export", "history", "import", "quarantine",
-                                        "record", "report", "unquarantine"])
+                                        "record", "renew", "report", "triage",
+                                        "unquarantine"])
         for name, sub in subs.items():
             self.assertIn("--db", sub.format_help(), name)
 
@@ -2959,7 +2992,9 @@ class TestRegeneratedPluginIsStable(unittest.TestCase):
             self.assertEqual(run_cli("--db", db, "quarantine", "--format",
                                      "pytest", "-o", tmp)[0], 0)
         before = self.read_all(tmp)
-        with mock.patch("time.time", return_value=2_000_000_000.0):
+        # a day later: the 30-day quarantine is still in force, so the same
+        # bytes (a later date past the expiry is covered in test_governance)
+        with mock.patch("time.time", return_value=1_000_086_400.0):
             self.assertEqual(run_cli("--db", db, "quarantine", "--format",
                                      "pytest", "-o", tmp)[0], 0)
         self.assertEqual(self.read_all(tmp), before)

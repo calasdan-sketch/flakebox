@@ -31,7 +31,9 @@ CREATE INDEX IF NOT EXISTS idx_results_run ON results(run_id);
 CREATE TABLE IF NOT EXISTS quarantine (
     test_id TEXT PRIMARY KEY,
     quarantined_at INTEGER,
-    reason TEXT
+    reason TEXT,
+    owner TEXT,
+    expires_at INTEGER
 );
 """
 
@@ -98,6 +100,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "env" not in cols:   # flakebox < 0.5: every run had one environment
         conn.execute("ALTER TABLE runs ADD COLUMN env TEXT")
         conn.commit()
+    qcols = {row[1] for row in conn.execute("PRAGMA table_info(quarantine)")}
+    for col, kind in (("owner", "TEXT"), ("expires_at", "INTEGER")):
+        if col not in qcols:    # flakebox < 0.6: a quarantine never expired
+            conn.execute(f"ALTER TABLE quarantine ADD COLUMN {col} {kind}")
+            conn.commit()
     fingerprint_legacy_runs(conn)
 
 
@@ -214,14 +221,34 @@ def active_test_ids(conn: sqlite3.Connection, retire_after: int) -> set[str]:
 
 
 def quarantine_add(conn: sqlite3.Connection, test_id: str,
-                   reason: str = "", at: int | None = None) -> bool:
+                   reason: str = "", at: int | None = None,
+                   owner: str | None = None,
+                   expires_at: int | None = None) -> bool:
     """Add a test to the quarantine set. Idempotent (set semantics): an
-    already-quarantined test keeps its original timestamp and reason.
-    Returns True if the test was newly quarantined."""
-    cur = conn.execute("INSERT OR IGNORE INTO quarantine "
-                       "(test_id, quarantined_at, reason) VALUES (?, ?, ?)",
-                       (test_id, int(time.time()) if at is None else int(at),
-                        reason))
+    already-quarantined test keeps its original timestamp, reason, owner
+    and expiry. `expires_at` (epoch seconds) is when the quarantine ends
+    and the test runs - and can fail the build - again; None never
+    expires. Returns True if the test was newly quarantined."""
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO quarantine "
+        "(test_id, quarantined_at, reason, owner, expires_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (test_id, int(time.time()) if at is None else int(at), reason,
+         owner, None if expires_at is None else int(expires_at)))
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def quarantine_renew(conn: sqlite3.Connection, test_id: str,
+                     expires_at: int | None, owner: str | None = None) -> bool:
+    """Set a new expiry (and, if given, owner) on a quarantined test.
+    Returns False if the test is not quarantined."""
+    if owner is None:
+        cur = conn.execute("UPDATE quarantine SET expires_at = ? "
+                           "WHERE test_id = ?", (expires_at, test_id))
+    else:
+        cur = conn.execute("UPDATE quarantine SET expires_at = ?, owner = ? "
+                           "WHERE test_id = ?", (expires_at, owner, test_id))
     conn.commit()
     return cur.rowcount == 1
 
@@ -238,15 +265,26 @@ def run_count(conn: sqlite3.Connection) -> int:
 
 
 def quarantined(conn: sqlite3.Connection) -> list[dict]:
+    """Every quarantine entry, expired ones included (see expired())."""
     cur = conn.cursor()
-    cur.execute("SELECT test_id, quarantined_at, reason FROM quarantine")
-    return [{"test_id": t, "at": a, "reason": r} for t, a, r in cur.fetchall()]
+    cur.execute("SELECT test_id, quarantined_at, reason, owner, expires_at "
+                "FROM quarantine")
+    return [{"test_id": t, "at": a, "reason": r, "owner": o,
+             "expires_at": e} for t, a, r, o, e in cur.fetchall()]
+
+
+def expired(entry: dict, now: float | None = None) -> bool:
+    """Has this quarantine entry's expiry passed?"""
+    e = entry.get("expires_at")
+    return e is not None and e <= (time.time() if now is None else now)
 
 
 def is_quarantined(conn: sqlite3.Connection, test_id: str) -> bool:
     cur = conn.cursor()
-    cur.execute("SELECT 1 FROM quarantine WHERE test_id = ?", (test_id,))
-    return cur.fetchone() is not None
+    cur.execute("SELECT expires_at FROM quarantine WHERE test_id = ?",
+                (test_id,))
+    row = cur.fetchone()
+    return row is not None and not expired({"expires_at": row[0]})
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +402,9 @@ def validate_export(data) -> dict:
                              f"with a test_id")
         _text(q["test_id"], f"quarantine[{i}].test_id", optional=False)
         _text(q.get("reason"), f"quarantine[{i}].reason")
+        _text(q.get("owner"), f"quarantine[{i}].owner")
         _number(q.get("at"), f"quarantine[{i}].at")
+        _number(q.get("expires_at"), f"quarantine[{i}].expires_at")
     return data
 
 
@@ -397,7 +437,8 @@ def import_data(conn: sqlite3.Connection, data: dict) -> dict:
     q_added = 0
     for q in data["quarantine"]:
         if quarantine_add(conn, q["test_id"], q.get("reason") or "",
-                          at=q.get("at")):
+                          at=q.get("at"), owner=q.get("owner"),
+                          expires_at=q.get("expires_at")):
             q_added += 1
     return {"runs_added": added, "runs_skipped": skipped,
             "quarantine_added": q_added}
